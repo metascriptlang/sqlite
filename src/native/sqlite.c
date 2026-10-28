@@ -42,6 +42,7 @@ int32_t msqBindBlob(sqlite3_stmt *stmt, int32_t index, const uint8_t *data, int6
 }
 
 int32_t msqStep(sqlite3_stmt *stmt) { return sqlite3_step(stmt); }
+int32_t msqReprepareCount(sqlite3_stmt *stmt) { return sqlite3_stmt_status(stmt, SQLITE_STMTSTATUS_REPREPARE, 0); }
 int32_t msqReset(sqlite3_stmt *stmt) { return sqlite3_reset(stmt); }
 int32_t msqClearBindings(sqlite3_stmt *stmt) { return sqlite3_clear_bindings(stmt); }
 int32_t msqFinalize(sqlite3_stmt *stmt) { return sqlite3_finalize(stmt); }

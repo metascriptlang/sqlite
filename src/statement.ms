@@ -3,7 +3,7 @@
 import {
 	sqlite3_stmt, msqBindDouble, msqBindInt64, msqBindNull, msqClearBindings, msqColumnBytes,
 	msqColumnCount, msqColumnDouble, msqColumnInt64, msqColumnName, msqColumnText, msqColumnType,
-	msqFinalize, msqParameterCount, msqParameterName, msqReset, msqStep,
+	msqFinalize, msqParameterCount, msqParameterName, msqReprepareCount, msqReset, msqStep,
 } from "./native/sqlite.h";
 import { SQLITE_OK, StatementHandle, misuse, statementFailure } from "./native";
 import { ErrorCode, SqliteError } from "./error";
@@ -44,6 +44,14 @@ function columnKindOf(code: int32): ColumnKind {
 	};
 }
 
+function sameNames(known: Readonly<string[]>, fields: Readonly<Span<string>>): boolean {
+	if (known.length != fields.length) return false;
+	for (let i: int32 = 0; i < fields.length; i++) {
+		if (known[i] != fields[i]) return false;
+	}
+	return true;
+}
+
 function kindName(kind: ColumnKind): string {
 	return match (kind) {
 		ColumnKind.Integer => "INTEGER",
@@ -59,6 +67,13 @@ export class Statement {
 	private handle: StatementHandle;
 	// The first failed field read of the row being decoded.
 	decodeFailure: SqliteError | null = null;
+	// Each parameter's name without its prefix; "" for a positional one.
+	private parameterKeys: string[] | null = null;
+	// The column indexes of the field list last resolved, valid while sqlite has not
+	// recompiled the statement since.
+	private resolvedFields: string[] = [];
+	private resolvedColumns: Readonly<int32[]> = [];
+	private resolvedCompile: int32 = -1;
 
 	constructor(sql: string, handle: StatementHandle) {
 		this.sql = sql;
@@ -133,16 +148,20 @@ export class Statement {
 	bindAll(values: Readonly<Named>): Result<void, SqliteError> {
 		const names = values.names;
 		const count = this.parameterCount();
-		const used: boolean[] = names.map((name: string): boolean => false);
+		const keys = this.parameterKeysOnce();
+		const used = new Array<boolean>(names.length);
 		for (let index: int32 = 1; index <= count; index++) {
-			const marker = this.parameterName(index);
-			if (marker == "" || marker.startsWith("?")) {
+			const key = keys[index - 1];
+			if (key == "") {
 				const positional = `parameter ${index} is positional; ` +
 					"named values bind only :name, @name or $name";
 				return Result.err(this.rangeError(positional));
 			}
-			const at = names.indexOf(marker.slice(1, marker.length)) as int32;
-			if (at < 0) return Result.err(this.rangeError(`no value for parameter ${marker}`));
+			const at = names.indexOf(key) as int32;
+			if (at < 0) {
+				const marker = this.parameterName(index);
+				return Result.err(this.rangeError(`no value for parameter ${marker}`));
+			}
 			used[at] = true;
 			try this.bind(index, values.params[at]);
 		}
@@ -153,6 +172,19 @@ export class Statement {
 			}
 		}
 		return Result.ok(null);
+	}
+
+	private parameterKeysOnce(): string[] {
+		const known = this.parameterKeys;
+		if (known != null) return known;
+		const keys: string[] = [];
+		for (let index: int32 = 1; index <= this.parameterCount(); index++) {
+			const marker = this.parameterName(index);
+			const named = marker != "" && !marker.startsWith("?");
+			keys.push(named ? marker.slice(1, marker.length) : "");
+		}
+		this.parameterKeys = keys;
+		return keys;
 	}
 
 	private parameterName(index: int32): string {
@@ -292,7 +324,25 @@ export class Statement {
 	}
 
 	// Column index of each field name, or MissingColumn naming the field and the columns.
-	columnIndexes(fields: Readonly<Span<string>>): Result<int32[], SqliteError> {
+	// Before the first step the names are those of the last compile; step() recompiles a
+	// statement whose schema changed.
+	columnIndexes(fields: Readonly<Span<string>>): Result<Readonly<int32[]>, SqliteError> {
+		const compile = this.compileCount();
+		if (compile == this.resolvedCompile && sameNames(this.resolvedFields, fields)) {
+			return Result.ok(this.resolvedColumns);
+		}
+		this.resolvedColumns = try this.resolve(fields);
+		this.resolvedFields = [...fields];
+		this.resolvedCompile = compile;
+		return Result.ok(this.resolvedColumns);
+	}
+
+	private compileCount(): int32 {
+		const pointer = this.handle.pointer;
+		return pointer == null ? -1 : msqReprepareCount(pointer);
+	}
+
+	private resolve(fields: Readonly<Span<string>>): Result<int32[], SqliteError> {
 		const count = this.columnCount();
 		const names: string[] = [];
 		for (let c: int32 = 0; c < count; c++) names.push(this.columnName(c));

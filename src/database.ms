@@ -75,6 +75,7 @@ export class Database {
 	private connection: Connection;
 	private cache: Map<string, Statement> = new Map<string, Statement>();
 	private stepping: Set<string> = new Set<string>();
+	private mostRecent: Statement | null = null;
 	private cacheSize: int32;
 	private depth: int32 = 0;
 
@@ -141,6 +142,7 @@ export class Database {
 		}
 		this.cache.clear();
 		this.stepping.clear();
+		this.mostRecent = null;
 		const rc = msqClose(pointer);
 		if (rc != SQLITE_OK) return Result.err(this.connection.failure(rc, ""));
 		this.connection.pointer = null;
@@ -181,8 +183,11 @@ export class Database {
 		const hit = this.cache.get(sql);
 		if (hit != null && !this.stepping.has(sql)) {
 			this.stepping.add(sql);
-			this.cache.delete(sql);
-			this.cache.set(sql, hit);
+			if (hit != this.mostRecent) {
+				this.cache.delete(sql);
+				this.cache.set(sql, hit);
+				this.mostRecent = hit;
+			}
 			return Result.ok(hit);
 		}
 		const stmt = try this.compile(sql, hit == null);
@@ -190,6 +195,7 @@ export class Database {
 		if (this.cache.size >= this.cacheSize) this.evictOne();
 		this.stepping.add(sql);
 		this.cache.set(sql, stmt);
+		this.mostRecent = stmt;
 		return Result.ok(stmt);
 	}
 
@@ -293,14 +299,16 @@ export class Database {
 		visit: (row: T) => boolean,
 	): Result<int32, SqliteError> {
 		return this.withStatement<P, int32>(sql, params, (stmt) => {
+			let more = try stmt.step();
 			const columns = try stmt.columnIndexes(rowFields(null as T | null));
 			let count: int32 = 0;
-			while (try stmt.step()) {
+			while (more) {
 				const row: T = rowDecode(stmt, columns, null as T | null);
 				const failed = stmt.decodeFailure;
 				if (failed != null) return Result.err(failed);
 				count += 1;
 				if (!visit(row)) break;
+				more = try stmt.step();
 			}
 			return Result.ok(count);
 		});
@@ -687,6 +695,65 @@ test "queryOne gives null for no row and the first row otherwise" {
 	assert first.ok && first.value != null && first.value.n == 4;
 }
 
+struct Leading {
+	a: int64;
+	b: string;
+}
+
+struct Trailing {
+	b: string;
+	c: float64;
+}
+
+test "one cached statement decodes into each struct by that struct's own columns" {
+	const db = memory();
+	const sql = "SELECT 1 AS a, 'x' AS b, 2.5 AS c";
+	for (let round: int32 = 0; round < 2; round++) {
+		const leading = db.queryOne<Leading>(sql, []);
+		assert leading.ok && leading.value != null;
+		assert leading.value.a == 1 && leading.value.b == "x";
+		const trailing = db.queryOne<Trailing>(sql, []);
+		assert trailing.ok && trailing.value != null;
+		assert trailing.value.b == "x" && trailing.value.c == 2.5;
+	}
+	assert db.openStatements() == 1;
+}
+
+struct Widened {
+	a: int64;
+	b: string;
+	c: float64;
+}
+
+test "a cached statement reads the columns of a table changed since its last run" {
+	const db = memory();
+	assert db.exec("CREATE TABLE t (a INTEGER, b TEXT); INSERT INTO t VALUES (1, 'x')").ok;
+	const sql = "SELECT * FROM t";
+	const before = db.queryOne<Leading>(sql, []);
+	assert before.ok && before.value != null && before.value.a == 1;
+	assert db.exec("DROP TABLE t; CREATE TABLE t (b TEXT, a INTEGER); " +
+		"INSERT INTO t VALUES ('y', 2)").ok;
+	const swapped = db.queryOne<Leading>(sql, []);
+	assert swapped.ok && swapped.value != null;
+	assert swapped.value.a == 2 && swapped.value.b == "y";
+	assert db.exec("ALTER TABLE t ADD COLUMN c REAL DEFAULT 0.5").ok;
+	const widened = db.queryOne<Widened>(sql, []);
+	assert widened.ok && widened.value != null;
+	assert widened.value.a == 2 && widened.value.b == "y" && widened.value.c == 0.5;
+	assert db.isCached(sql);
+}
+
+test "named values bind by name whatever order a cached statement meets them in" {
+	const db = memory();
+	assert db.exec("CREATE TABLE s (host TEXT, busy REAL)").ok;
+	const sql = "INSERT INTO s VALUES (:host, :busy)";
+	assert db.run(sql, named({ host: "a", busy: 1.0 })).ok;
+	assert db.run(sql, named({ busy: 2.0, host: "b" })).ok;
+	const b = db.queryOne<HostBusy>("SELECT host, busy FROM s WHERE busy = 2", []);
+	assert b.ok && b.value != null && b.value.host == "b";
+	assert countOf(db, "SELECT count(*) AS n FROM s WHERE host = 'a' AND busy = 1") == 1;
+}
+
 test "each visits rows without collecting them" {
 	const db = memory();
 	let total: int64 = 0;
@@ -809,6 +876,15 @@ test "a cache hit keeps its statement past one that was used less recently" {
 	assert countOf(db, "SELECT 1 AS n") == 1;
 	assert countOf(db, "SELECT 3 AS n") == 3;
 	assert db.isCached("SELECT 1 AS n") && !db.isCached("SELECT 2 AS n");
+}
+
+test "alternating cache hits keep use order, so eviction takes the one used longest ago" {
+	const options: OpenOptions = { ...DEFAULT_OPEN_OPTIONS, statementCacheSize: 2 };
+	const opened = Database.open(":memory:", options);
+	assert opened.ok;
+	const db = opened.value;
+	for (const n of [1, 2, 1, 1, 2, 3]) assert countOf(db, `SELECT ${n} AS n`) == n;
+	assert db.isCached("SELECT 2 AS n") && !db.isCached("SELECT 1 AS n");
 }
 
 test "the same SQL run while its cached statement is stepping gets its own statement" {

@@ -22,6 +22,7 @@ int32_t msqBindDouble(sqlite3_stmt *stmt, int32_t index, double value);
 int32_t msqBindText(sqlite3_stmt *stmt, int32_t index, const uint8_t *data, int64_t length);
 int32_t msqBindBlob(sqlite3_stmt *stmt, int32_t index, const uint8_t *data, int64_t length);
 int32_t msqStep(sqlite3_stmt *stmt);
+int32_t msqReprepareCount(sqlite3_stmt *stmt);
 int32_t msqReset(sqlite3_stmt *stmt);
 int32_t msqClearBindings(sqlite3_stmt *stmt);
 int32_t msqFinalize(sqlite3_stmt *stmt);
