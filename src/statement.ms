@@ -71,7 +71,7 @@ export class Statement {
 	private parameterKeys: string[] | null = null;
 	// The value order valueOrder last resolved, and the names it was resolved for.
 	private order: Readonly<int32[]> = [];
-	private orderNames: string[] | null = null;
+	private orderNames: string | null = null;
 	// The column indexes of the field list last resolved, valid while sqlite has not
 	// recompiled the statement since.
 	private resolvedFields: string[] = [];
@@ -154,10 +154,12 @@ export class Statement {
 		return Result.ok(null);
 	}
 
-	// The position in `names` of each parameter's value, resolved again only for other names.
-	private valueOrder(names: Readonly<string[]>): Result<Readonly<int32[]>, SqliteError> {
+	// The position among the comma-separated `fields` of each parameter's value, resolved again
+	// only for other fields.
+	private valueOrder(fields: string): Result<Readonly<int32[]>, SqliteError> {
 		const known = this.orderNames;
-		if (known != null && sameNames(known, names)) return Result.ok(this.order);
+		if (known != null && known == fields) return Result.ok(this.order);
+		const names: string[] = fields == "" ? [] : fields.split(",");
 		const count = this.parameterCount();
 		const keys = this.parameterKeysOnce();
 		const order: int32[] = [];
@@ -184,7 +186,7 @@ export class Statement {
 			}
 		}
 		this.order = order;
-		this.orderNames = [...names];
+		this.orderNames = fields;
 		return Result.ok(this.order);
 	}
 

@@ -63,9 +63,10 @@ function blobParam(value: uint8[] | null): Param {
 	return value == null ? Param.null() : Param.blob(value);
 }
 
-// Values for `:name`, `@name` or `$name` parameters, one per field name.
+// Values for `:name`, `@name` or `$name` parameters: `names` lists the parameter names separated
+// by commas, and `params` holds one value per name in that order.
 export struct Named {
-	names: string[];
+	names: string;
 	params: Param[];
 }
 

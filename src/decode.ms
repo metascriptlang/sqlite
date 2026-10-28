@@ -195,8 +195,8 @@ export macro rowDecode(stmt: Node, columns: Node, witness: Node): Node {
 	};
 }
 
-// A `Named` literal for `values`, a struct named by `null as P | null`: each field's name and
-// its parameter, built from the field's type.
+// A `Named` literal for `values`, a struct named by `null as P | null`: its field names as one
+// string literal and each field's parameter, built from the field's type.
 export macro namedValues(values: Node, witness: Node): Node {
 	const row = rowStruct(witness);
 	if (row.kind != NodeKind.TypeObject) {
@@ -205,7 +205,7 @@ export macro namedValues(values: Node, witness: Node): Node {
 	}
 	const line = witness.line;
 	const column = witness.column;
-	const names: Node[] = [];
+	let names = "";
 	const params: Node[] = [];
 	for (let field: int32 = 0; field < row.typExprFieldNames.length; field++) {
 		const name: string = row.typExprFieldNames[field];
@@ -226,7 +226,7 @@ export macro namedValues(values: Node, witness: Node): Node {
 			);
 			return witness;
 		}
-		names.push({ kind: NodeKind.StringLiteral, line: line, column: column, value: name });
+		names += field == 0 ? name : "," + name;
 		const callee = bindSym(make);
 		if (callee == null) {
 			error("sqlite: the parameter builder " + make + " is not in scope", witness);
@@ -244,7 +244,7 @@ export macro namedValues(values: Node, witness: Node): Node {
 	return {
 		kind: NodeKind.ObjectLiteral, line: line, column: column, keys: ["names", "params"],
 		properties: [
-			{ kind: NodeKind.ArrayLiteral, line: line, column: column, elements: names },
+			{ kind: NodeKind.StringLiteral, line: line, column: column, value: names },
 			{ kind: NodeKind.ArrayLiteral, line: line, column: column, elements: params },
 		],
 		keyLocations: [],
