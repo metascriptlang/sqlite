@@ -69,6 +69,9 @@ export class Statement {
 	decodeFailure: SqliteError | null = null;
 	// Each parameter's name without its prefix; "" for a positional one.
 	private parameterKeys: string[] | null = null;
+	// The value order valueOrder last resolved, and the names it was resolved for.
+	private order: Readonly<int32[]> = [];
+	private orderNames: string[] | null = null;
 	// The column indexes of the field list last resolved, valid while sqlite has not
 	// recompiled the statement since.
 	private resolvedFields: string[] = [];
@@ -146,9 +149,18 @@ export class Statement {
 	// Binds each `:name`, `@name` or `$name` parameter from the value of the same name; every
 	// parameter needs a value and every value a parameter.
 	bindAll(values: Readonly<Named>): Result<void, SqliteError> {
-		const names = values.names;
+		const order = try this.valueOrder(values.names);
+		for (let i: int32 = 0; i < order.length; i++) try this.bind(i + 1, values.params[order[i]]);
+		return Result.ok(null);
+	}
+
+	// The position in `names` of each parameter's value, resolved again only for other names.
+	private valueOrder(names: Readonly<string[]>): Result<Readonly<int32[]>, SqliteError> {
+		const known = this.orderNames;
+		if (known != null && sameNames(known, names)) return Result.ok(this.order);
 		const count = this.parameterCount();
 		const keys = this.parameterKeysOnce();
+		const order: int32[] = [];
 		const used = new Array<boolean>(names.length);
 		for (let index: int32 = 1; index <= count; index++) {
 			const key = keys[index - 1];
@@ -163,7 +175,7 @@ export class Statement {
 				return Result.err(this.rangeError(`no value for parameter ${marker}`));
 			}
 			used[at] = true;
-			try this.bind(index, values.params[at]);
+			order.push(at);
 		}
 		for (let i: int32 = 0; i < names.length; i++) {
 			if (!used[i]) {
@@ -171,7 +183,9 @@ export class Statement {
 				return Result.err(this.rangeError(unused));
 			}
 		}
-		return Result.ok(null);
+		this.order = order;
+		this.orderNames = [...names];
+		return Result.ok(this.order);
 	}
 
 	private parameterKeysOnce(): string[] {
