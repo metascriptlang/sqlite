@@ -954,6 +954,15 @@ test "the cache evicts its oldest statement past its size" {
 	assert db.openStatements() == 2;
 }
 
+test "a cache size of 0 keeps no statement past its query" {
+	const options: OpenOptions = { ...DEFAULT_OPEN_OPTIONS, statementCacheSize: 0 };
+	const opened = Database.open(":memory:", options);
+	assert opened.ok;
+	const db = opened.value;
+	for (let i: int32 = 0; i < 3; i++) assert countOf(db, "SELECT 1 AS n") == 1;
+	assert db.openStatements() == 0 && !db.isCached("SELECT 1 AS n");
+}
+
 test "a cache hit keeps its statement past one that was used less recently" {
 	const options: OpenOptions = { ...DEFAULT_OPEN_OPTIONS, statementCacheSize: 2 };
 	const opened = Database.open(":memory:", options);
