@@ -823,6 +823,17 @@ test "named values bind by name whatever order a cached statement meets them in"
 	assert countOf(db, "SELECT count(*) AS n FROM s WHERE host = 'a' AND busy = 1") == 1;
 }
 
+struct NoFields {}
+
+test "a struct without fields binds a statement without parameters and nothing else" {
+	const db = memory();
+	assert db.exec("CREATE TABLE s (n INTEGER)").ok;
+	const none: NoFields = {};
+	assert db.run("INSERT INTO s VALUES (1)", named(none)).ok;
+	const missing = db.run("INSERT INTO s VALUES (:n)", named(none));
+	assert !missing.ok && missing.error.message == "no value for parameter :n";
+}
+
 test "iterate visits rows without collecting them" {
 	const db = memory();
 	let total: int64 = 0;
