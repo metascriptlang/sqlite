@@ -338,7 +338,7 @@ export class Database {
 	private decodeRows<T, P>(
 		sql: string,
 		params: P,
-		visit: (row: T) => boolean,
+		visit: (sink row: T) => boolean,
 	): Result<int32, SqliteError> {
 		return this.withStatement<P, int32>(sql, params, (stmt) => {
 			let more = try stmt.step();
@@ -386,7 +386,7 @@ export class Database {
 			found = row;
 			return false;
 		});
-		return Result.ok(found);
+		return Result.ok(move found);
 	}
 
 	private iterateWith<T, P>(
