@@ -177,8 +177,8 @@ amalgamation with the same flags (`bench/baseline.c`).
 | `allJson`, per row | 507 µs | 305 ns | see below |
 
 Group commit through an actor, WAL file, 20 000 rows (`bench/actors.ms`, measured in an earlier
-session): 16.2 µs per row with
-a commit per row, 1.7 µs per row with one writer actor committing every 256 rows (9.5×).
+session): 16.2 µs per row with a commit per row, 1.7 µs per row with one writer actor committing
+every 256 rows (9.5×).
 
 Known gaps, each traced to its cause:
 
