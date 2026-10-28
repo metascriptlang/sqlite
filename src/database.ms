@@ -321,54 +321,47 @@ export class Database {
 		return this.iterateWith<T, Readonly<Named>>(sql, params, visit);
 	}
 
-	// Acquires the statement for `sql`, binds `params` and hands it to `use`; the statement goes
-	// back to the cache however `use` returns.
-	private withStatement<P, R>(
-		sql: string,
-		params: P,
-		use: (stmt: Statement) => Result<R, SqliteError>,
-	): Result<R, SqliteError> {
-		const lease = try this.acquire(sql);
-		defer this.release(lease);
-		try lease.statement.bindAll(params);
-		return use(lease.statement);
-	}
-
 	// Decodes rows into `T` until `visit` returns false or the rows end; gives the rows visited.
 	private decodeRows<T, P>(
 		sql: string,
 		params: P,
 		visit: (sink row: T) => boolean,
 	): Result<int32, SqliteError> {
-		return this.withStatement<P, int32>(sql, params, (stmt) => {
-			let more = try stmt.step();
-			const columns = try stmt.columnIndexes(rowFields(null as T | null));
-			let count: int32 = 0;
-			while (more) {
-				const row: T = rowDecode(stmt, columns, null as T | null);
-				const failed = stmt.decodeFailure;
-				if (failed != null) return Result.err(failed);
-				count += 1;
-				if (!visit(row)) break;
-				more = try stmt.step();
-			}
-			return Result.ok(count);
-		});
+		const lease = try this.acquire(sql);
+		defer this.release(lease);
+		const stmt = lease.statement;
+		try stmt.bindAll(params);
+		let more = try stmt.step();
+		const columns = try stmt.columnIndexes(rowFields(null as T | null));
+		let count: int32 = 0;
+		while (more) {
+			const row: T = rowDecode(stmt, columns, null as T | null);
+			const failed = stmt.decodeFailure;
+			if (failed != null) return Result.err(failed);
+			count += 1;
+			if (!visit(row)) break;
+			more = try stmt.step();
+		}
+		return Result.ok(count);
 	}
 
 	private runWith<P>(sql: string, params: P): Result<RunResult, SqliteError> {
 		const pointer = try this.live(sql);
-		return this.withStatement<P, RunResult>(sql, params, (stmt) => {
-			while (try stmt.step()) {}
-			return Result.ok({
-				changes: msqChanges(pointer),
-				lastInsertRowid: msqLastInsertRowid(pointer),
-			});
+		const lease = try this.acquire(sql);
+		defer this.release(lease);
+		try lease.statement.bindAll(params);
+		while (try lease.statement.step()) {}
+		return Result.ok({
+			changes: msqChanges(pointer),
+			lastInsertRowid: msqLastInsertRowid(pointer),
 		});
 	}
 
 	private allJsonWith<P>(sql: string, params: P): Result<string, SqliteError> {
-		return this.withStatement<P, string>(sql, params, rowsJson);
+		const lease = try this.acquire(sql);
+		defer this.release(lease);
+		try lease.statement.bindAll(params);
+		return rowsJson(lease.statement);
 	}
 
 	private allWith<T, P>(sql: string, params: P): Result<T[], SqliteError> {
@@ -381,12 +374,17 @@ export class Database {
 	}
 
 	private getWith<T, P>(sql: string, params: P): Result<T | null, SqliteError> {
-		let found: T | null = null;
-		try this.decodeRows<T, P>(sql, params, (row) => {
-			found = row;
-			return false;
-		});
-		return Result.ok(move found);
+		const lease = try this.acquire(sql);
+		defer this.release(lease);
+		const stmt = lease.statement;
+		try stmt.bindAll(params);
+		const more = try stmt.step();
+		const columns = try stmt.columnIndexes(rowFields(null as T | null));
+		if (!more) return Result.ok(null);
+		const row: T | null = rowDecode(stmt, columns, null as T | null);
+		const failed = stmt.decodeFailure;
+		if (failed != null) return Result.err(failed);
+		return Result.ok(row);
 	}
 
 	private iterateWith<T, P>(
