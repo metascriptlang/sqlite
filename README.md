@@ -164,19 +164,20 @@ An actor that owns the writer can also group commits: many small `record` SENDs 
 ## Performance
 
 Measured on an Apple M-series Mac (14 cores) that was also running other work, so read the
-ratios, not the absolute times; the rows were measured in two sessions, so compare within a row. `--release` build, medians of 5 interleaved runs. The C column
-does the same work directly against the same amalgamation with the same flags
-(`bench/baseline.c`).
+ratios, not the absolute times. `--release` build, in-memory database, medians of 5 runs
+interleaved with the C program. The C column does the same work directly against the same
+amalgamation with the same flags (`bench/baseline.c`).
 
 | Workload | MetaScript | C | Ratio |
 |---|---|---|---|
-| INSERT, positional parameters, one transaction | 506 ns | 204 ns | 2.5× |
-| INSERT, `named(...)` | 715 ns | 203 ns | 3.5× |
-| `all<T>`, per row | 246 ns | 104 ns | 2.4× |
-| `get<T>` by primary key | 855 ns | 477 ns | 1.8× |
-| `allJson`, per row | 429 µs | 459 ns | see below |
+| INSERT, positional parameters, one transaction | 243 ns | 174 ns | 1.4× |
+| INSERT, `named(...)` | 295 ns | 178 ns | 1.7× |
+| `all<T>`, per row | 149 ns | 70 ns | 2.1× |
+| `get<T>` by primary key | 551 ns | 379 ns | 1.5× |
+| `allJson`, per row | 507 µs | 305 ns | see below |
 
-Group commit through an actor, WAL file, 20 000 rows (`bench/actors.ms`): 16.2 µs per row with
+Group commit through an actor, WAL file, 20 000 rows (`bench/actors.ms`, measured in an earlier
+session): 16.2 µs per row with
 a commit per row, 1.7 µs per row with one writer actor committing every 256 rows (9.5×).
 
 Known gaps, each traced to its cause:
@@ -184,9 +185,10 @@ Known gaps, each traced to its cause:
 - `allJson` is quadratic in the result size because of a compiler issue: appending the result
   of a `try` expression to a string copies the whole string. Writing the cell into a local first
   measures 642 ns per row (1.4× C). The fix belongs in the compiler, so the library waits for it.
-- A prepared statement remembers the column positions of the struct it last decoded and the names
-  of its parameters, and resolves them again only after SQLite recompiles it for a schema change.
-  That halved `get`; most of what remains is the statement cache lookup and string copies.
+- Decoding a TEXT column copies the string once more than it needs to, because of a compiler
+  issue: returning a field of a local `Result` copies it instead of moving it. Without that copy
+  `all<T>` runs 114 instead of 132 ns per row in the same session (16% fewer instructions). The
+  fix belongs in the compiler.
 - Reader actors do not yet read in parallel: actors created on the main thread currently share
   one scheduler, so eight reader actors read no faster than one. The runtime fix is designed;
   `spawn` already scales across cores.
