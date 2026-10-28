@@ -754,6 +754,15 @@ test "get gives null for no row and the first row otherwise" {
 	assert first.ok && first.value != null && first.value.n == 4;
 }
 
+test "a struct that does not match the columns is refused even when no row comes back" {
+	const db = memory();
+	assert db.exec("CREATE TABLE t (m INTEGER)").ok;
+	const one = db.get<Count>("SELECT m FROM t");
+	assert !one.ok && one.error.code == ErrorCode.MissingColumn;
+	const every = db.all<Count>("SELECT m FROM t");
+	assert !every.ok && every.error.code == ErrorCode.MissingColumn;
+}
+
 struct Leading {
 	a: int64;
 	b: string;
