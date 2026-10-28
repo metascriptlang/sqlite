@@ -39,7 +39,7 @@ function removeDatabase(path: string): void {
 }
 
 function rowsOf(db: Database): int64 {
-	const r = db.queryOne<Count>("SELECT COUNT(*) AS n FROM t", []);
+	const r = db.get<Count>("SELECT COUNT(*) AS n FROM t");
 	if (!r.ok) throw new Error(r.error.toString());
 	if (r.value == null) throw new Error("COUNT(*) returned no row");
 	return r.value!.n;
@@ -51,7 +51,7 @@ function timedInsert(path: string, progress: Locked<Progress>): Result<float64, 
 	const db = try Database.open(path);
 	const started = performance.now();
 	lockedUpdate(progress, (_: Progress): Progress => ({ writing: true }));
-	try db.run("INSERT INTO t VALUES (2)", []);
+	try db.run("INSERT INTO t VALUES (2)");
 	const took = performance.now() - started;
 	try db.close();
 	return Result.ok(took);
@@ -74,7 +74,7 @@ test "a held write lock fails another writer with Busy once its busy timeout has
 	const waiter = opened(path, 100);
 	assert holder.exec("BEGIN IMMEDIATE").ok;
 	const started = performance.now();
-	const blocked = waiter.run("INSERT INTO t VALUES (1)", []);
+	const blocked = waiter.run("INSERT INTO t VALUES (1)");
 	const waited = performance.now() - started;
 	assert !blocked.ok && blocked.error.code == ErrorCode.Busy;
 	assert waited >= 100 && waited < 1000, `waited ${waited} ms`;
@@ -89,7 +89,7 @@ test "a reader keeps its snapshot while another connection commits, and sees it 
 	const reader = opened(path, 0);
 	assert reader.exec("BEGIN").ok;
 	assert rowsOf(reader) == 0;
-	assert writer.run("INSERT INTO t VALUES (1)", []).ok;
+	assert writer.run("INSERT INTO t VALUES (1)").ok;
 	assert rowsOf(reader) == 0;
 	assert reader.exec("COMMIT").ok;
 	assert rowsOf(reader) == 1;
@@ -121,13 +121,13 @@ test "a write lock held by another OS process is Busy here until that process co
 	const child = started.value;
 	assert awaitLine(child, "locked\n"), child.takeStderr();
 	const db = opened(path, 100);
-	const blocked = db.run("INSERT INTO t VALUES (2)", []);
+	const blocked = db.run("INSERT INTO t VALUES (2)");
 	assert !blocked.ok && blocked.error.code == ErrorCode.Busy;
 	assert child.write("commit\n", 5000).ok;
 	const exit = child.wait(30000);
 	assert exit.ok && exit.value.code == 0, child.takeStderr();
 	child.close();
-	assert db.run("INSERT INTO t VALUES (2)", []).ok;
+	assert db.run("INSERT INTO t VALUES (2)").ok;
 	assert rowsOf(db) == 2;
 	assert db.close().ok;
 	removeDatabase(path);

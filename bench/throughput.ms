@@ -1,6 +1,6 @@
 // Driver throughput against bench/baseline.c, the same work in plain C on the same amalgamation:
 // `msc run --release bench/throughput.ms`. One line per workload: `<db> <workload> <ns/op> <check>`.
-import { Database, SqliteError, integer, named, real, text } from "../src/index";
+import { Database, Param, SqliteError, named } from "../src/index";
 import { exists, remove } from "std/fs";
 
 const ROWS: int32 = 100000;
@@ -60,7 +60,7 @@ function workloads(label: string, db: Database): Result<void, string> {
 	try db.transaction((): Result<void, string> => {
 		for (let i: int32 = 0; i < ROWS; i++) {
 			try checked(db.run("INSERT INTO t (name, score, n) VALUES (?, ?, ?)", [
-				text(nameOf(i)), real(scoreOf(i)), integer(i as int64),
+				Param.text(nameOf(i)), Param.real(scoreOf(i)), Param.integer(i as int64),
 			]));
 		}
 		return Result.ok(null);
@@ -78,7 +78,7 @@ function workloads(label: string, db: Database): Result<void, string> {
 	report(label, "insert_named", start, ROWS, ROWS as int64);
 
 	start = performance.now();
-	const rows = try checked(db.query<Row>("SELECT id, name, score, n FROM t", []));
+	const rows = try checked(db.all<Row>("SELECT id, name, score, n FROM t"));
 	let sum: int64 = 0;
 	for (const row of rows) {
 		sum += row.id + row.n + (row.name.byteLength() as int64) + ((row.score * 4) as int64);
@@ -86,15 +86,15 @@ function workloads(label: string, db: Database): Result<void, string> {
 	report(label, "query_struct", start, rows.length, sum);
 
 	start = performance.now();
-	const json = try checked(db.queryJson("SELECT id, name, score, n FROM t", []));
+	const json = try checked(db.allJson("SELECT id, name, score, n FROM t"));
 	report(label, "query_json", start, ROWS, json.byteLength() as int64);
 
 	start = performance.now();
 	let found: int64 = 0;
 	for (let i: int32 = 0; i < LOOKUPS; i++) {
 		const id = ((i * 7919) % ROWS + 1) as int64;
-		const row = try checked(db.queryOne<Row>(
-			"SELECT id, name, score, n FROM t WHERE id = ?", [integer(id)],
+		const row = try checked(db.get<Row>(
+			"SELECT id, name, score, n FROM t WHERE id = ?", [Param.integer(id)],
 		));
 		if (row != null) found += row!.n;
 	}
@@ -108,7 +108,7 @@ function main(): Result<void, string> {
 		if (exists(WAL_PATH + suffix)) remove(WAL_PATH + suffix);
 	}
 	const wal = try checked(Database.open(WAL_PATH));
-	try checked(wal.queryOne<Mode>("PRAGMA journal_mode=WAL", []));
+	try checked(wal.get<Mode>("PRAGMA journal_mode=WAL"));
 	try workloads("wal", wal);
 	return Result.ok(null);
 }

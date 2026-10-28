@@ -5,6 +5,4 @@ export {
 } from "./database";
 export { ColumnKind, Statement } from "./statement";
 export { ErrorCode, SqliteError } from "./error";
-export {
-	Named, Param, ParamKind, blob, integer, maybe, named, nullParam, real, text,
-} from "./param";
+export { Named, Param, ParamKind, named } from "./param";

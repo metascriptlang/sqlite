@@ -1,8 +1,18 @@
 // Adversarial edges of the driver: integer and text boundaries, storage-class mismatches,
 // misuse after close, transaction failure paths, the statement cache and native lifetimes.
-import {
-	Database, ErrorCode, SqliteError, Statement, blob, integer, named, nullParam, real, text,
-} from "../src/index";
+import { Database, ErrorCode, Param, SqliteError, Statement, named } from "../src/index";
+import { Connection } from "../src/native";
+import { msqOpen, sqlite3 } from "../src/native/sqlite.h";
+
+@include("../vendor/sqlite3/sqlite3.h");
+extern function sqliteLimit(
+	db: Ptr<sqlite3>,
+	limit: int32,
+	value: int32,
+): int32 from "sqlite3_limit";
+
+const SQLITE_LIMIT_SQL_LENGTH: int32 = 1;
+const OPEN_READWRITE_CREATE: int32 = 6;
 
 function memory(): Database {
 	const opened = Database.open(":memory:");
@@ -28,7 +38,7 @@ struct Kind { k: string; }
 struct Count { n: int64; }
 
 function count(db: Database, sql: string): int64 {
-	const r = db.queryOne<Count>(sql, []);
+	const r = db.get<Count>(sql);
 	if (!r.ok || r.value == null) return -1;
 	return r.value!.n;
 }
@@ -39,14 +49,17 @@ test "int64 max and min round-trip through a bound parameter" {
 	const db = memory();
 	const max: int64 = 9223372036854775807;
 	const min: int64 = -9223372036854775807 - 1;
-	const r = db.query<Wide>("SELECT ? AS n UNION ALL SELECT ?", [integer(max), integer(min)]);
+	const r = db.all<Wide>(
+		"SELECT ? AS n UNION ALL SELECT ?",
+		[Param.integer(max), Param.integer(min)],
+	);
 	assert r.ok && r.value.length == 2;
 	assert r.value[0].n == max && r.value[1].n == min;
 }
 
 test "int64 min written as a SQL literal decodes exactly" {
 	const db = memory();
-	const r = db.queryOne<Wide>("SELECT -9223372036854775808 AS n", []);
+	const r = db.get<Wide>("SELECT -9223372036854775808 AS n");
 	assert r.ok && r.value != null && r.value!.n == -9223372036854775807 - 1;
 }
 
@@ -54,84 +67,83 @@ test "int64 max and min forward to JSON as exact decimals" {
 	const db = memory();
 	const max: int64 = 9223372036854775807;
 	const min: int64 = -9223372036854775807 - 1;
-	const r = db.queryJson("SELECT ? AS a, ? AS b", [integer(max), integer(min)]);
+	const r = db.allJson("SELECT ? AS a, ? AS b", [Param.integer(max), Param.integer(min)]);
 	assert r.ok && r.value == "[{\"a\":9223372036854775807,\"b\":-9223372036854775808}]";
 }
 
 test "an int64 past int32 into an int32 field is OutOfRange, not wrapped" {
 	const db = memory();
-	const r = db.query<Small>("SELECT 4294967297 AS n", []);
+	const r = db.all<Small>("SELECT 4294967297 AS n");
 	assert !r.ok && r.error.code == ErrorCode.OutOfRange;
 	assert r.error.message.contains("4294967297");
 }
 
 test "int32 bounds decode exactly at both ends" {
 	const db = memory();
-	const r = db.query<Small>("SELECT 2147483647 AS n UNION ALL SELECT -2147483648", []);
+	const r = db.all<Small>("SELECT 2147483647 AS n UNION ALL SELECT -2147483648");
 	assert r.ok && r.value[0].n == 2147483647 && r.value[1].n == -2147483648;
 }
 
 test "256 and -1 into a uint8 field are OutOfRange; 0 and 255 decode" {
 	const db = memory();
-	const high = db.query<Byte>("SELECT 256 AS n", []);
+	const high = db.all<Byte>("SELECT 256 AS n");
 	assert !high.ok && high.error.code == ErrorCode.OutOfRange;
-	const low = db.query<Byte>("SELECT -1 AS n", []);
+	const low = db.all<Byte>("SELECT -1 AS n");
 	assert !low.ok && low.error.code == ErrorCode.OutOfRange;
-	const ok = db.query<Byte>("SELECT 0 AS n UNION ALL SELECT 255", []);
+	const ok = db.all<Byte>("SELECT 0 AS n UNION ALL SELECT 255");
 	assert ok.ok && ok.value[0].n == 0 && ok.value[1].n == 255;
 }
 
 test "-1 into a uint32 field is OutOfRange; 4294967295 decodes" {
 	const db = memory();
-	const neg = db.query<Unsigned>("SELECT -1 AS n", []);
+	const neg = db.all<Unsigned>("SELECT -1 AS n");
 	assert !neg.ok && neg.error.code == ErrorCode.OutOfRange;
-	const max = db.queryOne<Unsigned>("SELECT 4294967295 AS n", []);
+	const max = db.get<Unsigned>("SELECT 4294967295 AS n");
 	assert max.ok && max.value != null && max.value!.n == 4294967295;
 }
 
 test "32768 into an int16 field is OutOfRange" {
 	const db = memory();
-	const r = db.query<Short>("SELECT 32768 AS n", []);
+	const r = db.all<Short>("SELECT 32768 AS n");
 	assert !r.ok && r.error.code == ErrorCode.OutOfRange;
 }
 
 test "a REAL holding a whole number into an integer field is WrongKind" {
 	const db = memory();
-	const r = db.query<Small>("SELECT 3.0 AS n", []);
+	const r = db.all<Small>("SELECT 3.0 AS n");
 	assert !r.ok && r.error.code == ErrorCode.WrongKind;
-	const wide = db.query<Wide>("SELECT 3.0 AS n", []);
+	const wide = db.all<Wide>("SELECT 3.0 AS n");
 	assert !wide.ok && wide.error.code == ErrorCode.WrongKind;
 }
 
 test "Infinity binds as REAL and round-trips" {
 	const db = memory();
-	const kind = db.queryOne<Kind>("SELECT typeof(?) AS k", [real(Infinity)]);
+	const kind = db.get<Kind>("SELECT typeof(?) AS k", [Param.real(Infinity)]);
 	assert kind.ok && kind.value != null && kind.value!.k == "real";
-	const r = db.queryOne<Real>("SELECT ? AS n", [real(-Infinity)]);
+	const r = db.get<Real>("SELECT ? AS n", [Param.real(-Infinity)]);
 	assert r.ok && r.value != null && r.value!.n == -Infinity;
 }
 
 test "NaN is refused, because SQLite would store it as NULL" {
 	const db = memory();
-	const kind = db.queryOne<Kind>("SELECT typeof(?) AS k", [real(NaN)]);
+	const kind = db.get<Kind>("SELECT typeof(?) AS k", [Param.real(NaN)]);
 	assert !kind.ok && kind.error.code == ErrorCode.Range && kind.error.message.contains("NaN");
 	assert db.exec("CREATE TABLE f (n REAL)").ok;
-	const insert = db.run("INSERT INTO f VALUES (?)", [real(NaN)]);
+	const insert = db.run("INSERT INTO f VALUES (?)", [Param.real(NaN)]);
 	assert !insert.ok && insert.error.code == ErrorCode.Range;
 	assert count(db, "SELECT count(*) AS n FROM f") == 0;
 }
 
 test "a non-finite REAL forwards to JSON as null" {
 	const db = memory();
-	const r = db.queryJson("SELECT ? AS a, ? AS b", [real(Infinity), real(-Infinity)]);
+	const r = db.allJson("SELECT ? AS a, ? AS b", [Param.real(Infinity), Param.real(-Infinity)]);
 	assert r.ok && r.value == "[{\"a\":null,\"b\":null}]";
 }
 
 test "extreme finite REALs forward as JSON numbers that parse back" {
 	const db = memory();
-	const r = db.queryJson(
+	const r = db.allJson(
 		"SELECT 1e300 AS a, 5e-324 AS b, -0.0 AS c, 123456789.125 AS d, 1e21 AS e",
-		[],
 	);
 	assert r.ok;
 	const parsed = JSON.parseValue(r.value);
@@ -142,7 +154,7 @@ test "extreme finite REALs forward as JSON numbers that parse back" {
 
 test "an empty string round-trips as TEXT, not NULL" {
 	const db = memory();
-	const r = db.queryOne<Words>("SELECT ? AS s", [text("")]);
+	const r = db.get<Words>("SELECT ? AS s", [Param.text("")]);
 	assert r.ok && r.value != null && r.value!.s == "";
 }
 
@@ -150,20 +162,20 @@ test "text bound with an embedded NUL is refused on read, not cut short" {
 	const db = memory();
 	const withNul = "a" + String.fromCharCode(0) + "b";
 	assert withNul.byteLength() == 3;
-	const len = db.queryOne<Count>("SELECT length(CAST(? AS BLOB)) AS n", [text(withNul)]);
+	const len = db.get<Count>("SELECT length(CAST(? AS BLOB)) AS n", [Param.text(withNul)]);
 	assert len.ok && len.value != null && len.value!.n == 3;
-	const r = db.query<Words>("SELECT ? AS s", [text(withNul)]);
+	const r = db.all<Words>("SELECT ? AS s", [Param.text(withNul)]);
 	assert !r.ok && r.error.code == ErrorCode.OutOfRange;
 }
 
 test "emoji and Vietnamese text round-trip byte-exact and count as characters in SQL" {
 	const db = memory();
 	const s = "Tiếng Việt có dấu 🚀👩‍👩‍👧";
-	const r = db.queryOne<Words>("SELECT ? AS s", [text(s)]);
+	const r = db.get<Words>("SELECT ? AS s", [Param.text(s)]);
 	assert r.ok && r.value != null && r.value!.s == s;
-	const bytes = db.queryOne<Count>("SELECT length(CAST(? AS BLOB)) AS n", [text(s)]);
+	const bytes = db.get<Count>("SELECT length(CAST(? AS BLOB)) AS n", [Param.text(s)]);
 	assert bytes.ok && bytes.value != null && bytes.value!.n == s.byteLength() as int64;
-	const literal = db.queryOne<Words>("SELECT 'Việt 🚀' AS s", []);
+	const literal = db.get<Words>("SELECT 'Việt 🚀' AS s");
 	assert literal.ok && literal.value != null && literal.value!.s == "Việt 🚀";
 }
 
@@ -171,26 +183,26 @@ test "1 MB of text round-trips" {
 	const db = memory();
 	const big = "ệ".repeat(349526);
 	assert db.exec("CREATE TABLE t (s TEXT)").ok;
-	assert db.run("INSERT INTO t VALUES (?)", [text(big)]).ok;
-	const r = db.queryOne<Words>("SELECT s FROM t", []);
+	assert db.run("INSERT INTO t VALUES (?)", [Param.text(big)]).ok;
+	const r = db.get<Words>("SELECT s FROM t");
 	assert r.ok && r.value != null && r.value!.s == big;
 }
 
 test "a BLOB into a string field is WrongKind" {
 	const db = memory();
-	const r = db.query<Words>("SELECT x'4142' AS s", []);
+	const r = db.all<Words>("SELECT x'4142' AS s");
 	assert !r.ok && r.error.code == ErrorCode.WrongKind;
 }
 
 test "a TEXT into a uint8[] field is WrongKind" {
 	const db = memory();
-	const r = db.query<Bytes>("SELECT 'AB' AS b", []);
+	const r = db.all<Bytes>("SELECT 'AB' AS b");
 	assert !r.ok && r.error.code == ErrorCode.WrongKind;
 }
 
 test "an INTEGER into a string field is WrongKind, not formatted" {
 	const db = memory();
-	const r = db.query<Words>("SELECT 42 AS s", []);
+	const r = db.all<Words>("SELECT 42 AS s");
 	assert !r.ok && r.error.code == ErrorCode.WrongKind;
 }
 
@@ -199,9 +211,9 @@ test "an INTEGER into a string field is WrongKind, not formatted" {
 test "an empty blob round-trips as a zero-length BLOB" {
 	const db = memory();
 	const empty: uint8[] = [];
-	const r = db.queryOne<Bytes>("SELECT ? AS b", [blob(empty)]);
+	const r = db.get<Bytes>("SELECT ? AS b", [Param.blob(empty)]);
 	assert r.ok && r.value != null && r.value!.b.length == 0;
-	const json = db.queryJson("SELECT ? AS b", [blob(empty)]);
+	const json = db.allJson("SELECT ? AS b", [Param.blob(empty)]);
 	assert json.ok && json.value == "[{\"b\":\"\"}]";
 }
 
@@ -215,8 +227,8 @@ test "a 1 MB blob round-trips byte-exact" {
 	const db = memory();
 	const bytes = pattern(1048576);
 	assert db.exec("CREATE TABLE b (v BLOB)").ok;
-	assert db.run("INSERT INTO b VALUES (?)", [blob(bytes)]).ok;
-	const r = db.queryOne<Bytes>("SELECT v AS b FROM b", []);
+	assert db.run("INSERT INTO b VALUES (?)", [Param.blob(bytes)]).ok;
+	const r = db.get<Bytes>("SELECT v AS b FROM b");
 	assert r.ok && r.value != null;
 	const back = r.value!.b;
 	assert back.length == bytes.length;
@@ -230,19 +242,19 @@ test "a 1 MB blob round-trips byte-exact" {
 	assert same;
 }
 
-test "queryJson encodes a 1 MB blob as base64 of the right length" {
+test "allJson encodes a 1 MB blob as base64 of the right length" {
 	const db = memory();
 	const bytes = pattern(1048576);
-	const r = db.queryJson("SELECT ? AS b", [blob(bytes)]);
+	const r = db.allJson("SELECT ? AS b", [Param.blob(bytes)]);
 	assert r.ok;
 	// 1048576 bytes → 349526 groups → 1398104 base64 chars, plus `[{"b":""}]`.
 	assert r.value.length == 1398104 + 10;
 	assert r.value.startsWith("[{\"b\":\"ByZF") && r.value.endsWith("==\"}]");
 }
 
-test "queryJson base64 matches sqlite's own hex for one to three bytes" {
+test "allJson base64 matches sqlite's own hex for one to three bytes" {
 	const db = memory();
-	const r = db.queryJson("SELECT x'ff' AS a, x'fffe' AS b, x'fffefd' AS c, x'00' AS d", []);
+	const r = db.allJson("SELECT x'ff' AS a, x'fffe' AS b, x'fffefd' AS c, x'00' AS d");
 	assert r.ok && r.value == "[{\"a\":\"/w==\",\"b\":\"//4=\",\"c\":\"//79\",\"d\":\"AA==\"}]";
 }
 
@@ -250,25 +262,25 @@ test "queryJson base64 matches sqlite's own hex for one to three bytes" {
 
 test "NULL into a non-nullable field is WrongKind" {
 	const db = memory();
-	const ints = db.query<Small>("SELECT NULL AS n", []);
+	const ints = db.all<Small>("SELECT NULL AS n");
 	assert !ints.ok && ints.error.code == ErrorCode.WrongKind;
-	const words = db.query<Words>("SELECT ? AS s", [nullParam()]);
+	const words = db.all<Words>("SELECT ? AS s", [Param.null()]);
 	assert !words.ok && words.error.code == ErrorCode.WrongKind;
-	const bytes = db.query<Bytes>("SELECT NULL AS b", []);
+	const bytes = db.all<Bytes>("SELECT NULL AS b");
 	assert !bytes.ok && bytes.error.code == ErrorCode.WrongKind;
 }
 
 test "NULL into a T | null field decodes as null" {
 	const db = memory();
-	const r = db.queryOne<MaybeWords>("SELECT NULL AS s", []);
+	const r = db.get<MaybeWords>("SELECT NULL AS s");
 	assert r.ok && r.value != null && r.value!.s == null;
-	const real = db.queryOne<MaybeReal>("SELECT NULL AS n", []);
+	const real = db.get<MaybeReal>("SELECT NULL AS n");
 	assert real.ok && real.value != null && real.value!.n == null;
 }
 
 test "a T | null field still checks the storage class of a non-NULL value" {
 	const db = memory();
-	const r = db.query<MaybeWords>("SELECT 7 AS s", []);
+	const r = db.all<MaybeWords>("SELECT 7 AS s");
 	assert !r.ok && r.error.code == ErrorCode.WrongKind;
 }
 
@@ -279,14 +291,14 @@ test "every call after close() fails with Misuse" {
 	assert db.close().ok;
 	const prepared = db.prepare("SELECT 1");
 	assert !prepared.ok && prepared.error.code == ErrorCode.Misuse;
-	const q = db.query<Small>("SELECT 1 AS n", []);
+	const q = db.all<Small>("SELECT 1 AS n");
 	assert !q.ok && q.error.code == ErrorCode.Misuse;
-	const one = db.queryOne<Small>("SELECT 1 AS n", []);
+	const one = db.get<Small>("SELECT 1 AS n");
 	assert !one.ok && one.error.code == ErrorCode.Misuse;
-	const json = db.queryJson("SELECT 1 AS n", []);
+	const json = db.allJson("SELECT 1 AS n");
 	assert !json.ok && json.error.code == ErrorCode.Misuse;
 	let visited = 0;
-	const each = db.each<Small>("SELECT 1 AS n", [], (row: Small): void => {
+	const each = db.iterate<Small>("SELECT 1 AS n", (row: Small): void => {
 		visited += 1;
 	});
 	assert !each.ok && each.error.code == ErrorCode.Misuse && visited == 0;
@@ -300,12 +312,12 @@ test "every call after close() fails with Misuse" {
 test "close() while a prepared Statement is held fails Busy and the db stays usable" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n)").ok;
-	assert db.run("INSERT INTO t VALUES (?)", [integer(1)]).ok;
+	assert db.run("INSERT INTO t VALUES (?)", [Param.integer(1)]).ok;
 	const held = db.prepare("SELECT n FROM t");
 	assert held.ok;
 	const refused = db.close();
 	assert !refused.ok && refused.error.code == ErrorCode.Busy && db.isOpen;
-	assert db.run("INSERT INTO t VALUES (?)", [integer(2)]).ok;
+	assert db.run("INSERT INTO t VALUES (?)", [Param.integer(2)]).ok;
 	assert count(db, "SELECT COUNT(*) AS n FROM t") == 2;
 	const stmt = held.value;
 	const stepped = stmt.step();
@@ -314,16 +326,17 @@ test "close() while a prepared Statement is held fails Busy and the db stays usa
 	assert db.close().ok;
 }
 
-test "close() inside an each visitor does not pull the stepping statement away" {
+test "close() inside an iterate visitor does not pull the stepping statement away" {
 	const db = memory();
 	let closed: boolean | null = null;
 	let visits = 0;
-	const r = db.each<Count>("SELECT value AS n FROM json_each('[1,2,3]')", [], (row: Count): void => {
+	const sql = "SELECT value AS n FROM json_each('[1,2,3]')";
+	const r = db.iterate<Count>(sql, (row: Count): void => {
 		visits += 1;
 		if (closed == null) closed = db.close().ok;
 	});
 	// Either close refuses (the statement is in use) and every row is visited, or it is
-	// documented to abort the iteration; it must never succeed and leave `each` reporting ok.
+	// documented to abort the iteration; it must never succeed and leave `iterate` reporting ok.
 	assert closed != null;
 	if (closed!) {
 		assert !r.ok;
@@ -349,7 +362,7 @@ test "run() does not silently drop a second statement after multi-byte text" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (s TEXT)").ok;
 	const sql = "INSERT INTO t VALUES ('" + "🚀".repeat(10) + "'); DROP TABLE t";
-	const r = db.run(sql, []);
+	const r = db.run(sql);
 	assert !r.ok, "run accepted two statements and ran only the first";
 }
 
@@ -366,7 +379,7 @@ test "a syntax error carries the SQL and sqlite's message from every entry point
 	const sql = "SELEKT 1 AS n";
 	const p = db.prepare(sql);
 	assert !p.ok && p.error.sql == sql && p.error.message.contains("syntax error");
-	const q = db.query<Small>(sql, []);
+	const q = db.all<Small>(sql);
 	assert !q.ok && q.error.sql == sql && q.error.message.contains("syntax error");
 	const e = db.exec(sql);
 	assert !e.ok && e.error.sql == sql && e.error.message.contains("syntax error");
@@ -379,30 +392,30 @@ struct HostBusy { host: string; busy: float64; }
 test "named() with a missing field is refused naming the parameter" {
 	const db = memory();
 	const v: HostOnly = { host: "a" };
-	const r = db.query<HostOnly>("SELECT :host AS host, :busy AS busy", named(v));
+	const r = db.all<HostOnly>("SELECT :host AS host, :busy AS busy", named(v));
 	assert !r.ok && r.error.code == ErrorCode.Range && r.error.message.contains(":busy");
 }
 
 test "named() with an extra field is refused naming the field" {
 	const db = memory();
 	const v: HostBusy = { host: "a", busy: 1.5 };
-	const r = db.query<HostOnly>("SELECT :host AS host", named(v));
+	const r = db.all<HostOnly>("SELECT :host AS host", named(v));
 	assert !r.ok && r.error.code == ErrorCode.Range && r.error.message.contains("busy");
 }
 
 test "a ? or ?NNN parameter with named() is refused" {
 	const db = memory();
 	const v: HostOnly = { host: "a" };
-	const bare = db.query<HostOnly>("SELECT ? AS host", named(v));
+	const bare = db.all<HostOnly>("SELECT ? AS host", named(v));
 	assert !bare.ok && bare.error.code == ErrorCode.Range;
-	const numbered = db.query<HostOnly>("SELECT ?1 AS host", named(v));
+	const numbered = db.all<HostOnly>("SELECT ?1 AS host", named(v));
 	assert !numbered.ok && numbered.error.code == ErrorCode.Range;
 }
 
 test "a named parameter used twice binds once from one field" {
 	const db = memory();
 	const v: HostOnly = { host: "a" };
-	const r = db.queryOne<HostOnly>("SELECT :host || :host AS host", named(v));
+	const r = db.get<HostOnly>("SELECT :host || :host AS host", named(v));
 	assert r.ok && r.value != null && r.value!.host == "aa";
 }
 
@@ -411,9 +424,9 @@ test "binding an index outside the statement is Range" {
 	const p = db.prepare("SELECT ?");
 	assert p.ok;
 	const stmt = p.value;
-	const zero = stmt.bind(0, integer(1));
+	const zero = stmt.bind(0, Param.integer(1));
 	assert !zero.ok && zero.error.code == ErrorCode.Range;
-	const past = stmt.bind(2, integer(1));
+	const past = stmt.bind(2, Param.integer(1));
 	assert !past.ok && past.error.code == ErrorCode.Range;
 	stmt.finalize();
 }
@@ -425,7 +438,7 @@ test "a finalized Statement refuses bind and step with Misuse; finalize twice is
 	const stmt = p.value;
 	stmt.finalize();
 	stmt.finalize();
-	const b = stmt.bind(1, integer(1));
+	const b = stmt.bind(1, Param.integer(1));
 	assert !b.ok && b.error.code == ErrorCode.Misuse;
 	const s = stmt.step();
 	assert !s.ok && s.error.code == ErrorCode.Misuse;
@@ -439,8 +452,8 @@ test "a body returning err rolls back its writes" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n)").ok;
 	const r = db.transaction((): Result<void, string> => {
-		db.run("INSERT INTO t VALUES (1)", []);
-		db.run("INSERT INTO t VALUES (2)", []);
+		db.run("INSERT INTO t VALUES (1)");
+		db.run("INSERT INTO t VALUES (2)");
 		return Result.err("stop");
 	}, message);
 	assert !r.ok && r.error == "stop";
@@ -453,7 +466,7 @@ test "a throwing body rolls back and the next transaction commits" {
 	let caught = false;
 	try {
 		db.transaction((): Result<void, string> => {
-			db.run("INSERT INTO t VALUES (1)", []);
+			db.run("INSERT INTO t VALUES (1)");
 			throw new Error("boom");
 		}, message);
 	} catch (e) {
@@ -462,7 +475,7 @@ test "a throwing body rolls back and the next transaction commits" {
 	assert caught;
 	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
 	const next = db.transaction((): Result<void, string> => {
-		if (!db.run("INSERT INTO t VALUES (2)", []).ok) return Result.err("insert");
+		if (!db.run("INSERT INTO t VALUES (2)").ok) return Result.err("insert");
 		return Result.ok(null);
 	}, message);
 	assert next.ok && count(db, "SELECT COUNT(*) AS n FROM t") == 1;
@@ -474,9 +487,9 @@ test "a throw two levels deep rolls back every level" {
 	let caught = false;
 	try {
 		db.transaction((): Result<void, string> => {
-			db.run("INSERT INTO t VALUES (1)", []);
+			db.run("INSERT INTO t VALUES (1)");
 			return db.transaction((): Result<void, string> => {
-				db.run("INSERT INTO t VALUES (2)", []);
+				db.run("INSERT INTO t VALUES (2)");
 				throw new Error("deep");
 			}, message);
 		}, message);
@@ -492,18 +505,18 @@ test "three levels with the middle failing keep only the outer work" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n)").ok;
 	const outer = db.transaction((): Result<void, string> => {
-		if (!db.run("INSERT INTO t VALUES (1)", []).ok) return Result.err("outer");
+		if (!db.run("INSERT INTO t VALUES (1)").ok) return Result.err("outer");
 		const middle = db.transaction((): Result<void, string> => {
-			if (!db.run("INSERT INTO t VALUES (10)", []).ok) return Result.err("middle");
+			if (!db.run("INSERT INTO t VALUES (10)").ok) return Result.err("middle");
 			const inner = db.transaction((): Result<void, string> => {
-				if (!db.run("INSERT INTO t VALUES (100)", []).ok) return Result.err("inner");
+				if (!db.run("INSERT INTO t VALUES (100)").ok) return Result.err("inner");
 				return Result.ok(null);
 			}, message);
 			if (!inner.ok) return inner;
 			return Result.err("middle fails");
 		}, message);
 		if (middle.ok) return Result.err("middle should have failed");
-		if (!db.run("INSERT INTO t VALUES (2)", []).ok) return Result.err("after middle");
+		if (!db.run("INSERT INTO t VALUES (2)").ok) return Result.err("after middle");
 		return Result.ok(null);
 	}, message);
 	assert outer.ok;
@@ -517,29 +530,140 @@ test "a failed COMMIT rolls back and the next transaction works" {
 			"CREATE TABLE c (pid INTEGER REFERENCES p (id) DEFERRABLE INITIALLY DEFERRED)",
 	).ok;
 	const failed = db.transaction((): Result<void, string> => {
-		if (!db.run("INSERT INTO c VALUES (42)", []).ok) return Result.err("insert");
+		if (!db.run("INSERT INTO c VALUES (42)").ok) return Result.err("insert");
 		return Result.ok(null);
 	}, message);
 	assert !failed.ok && failed.error.contains("FOREIGN KEY");
 	assert count(db, "SELECT COUNT(*) AS n FROM c") == 0;
 	const next = db.transaction((): Result<void, string> => {
-		if (!db.run("INSERT INTO p VALUES (1)", []).ok) return Result.err("insert p");
-		if (!db.run("INSERT INTO c VALUES (1)", []).ok) return Result.err("insert c");
+		if (!db.run("INSERT INTO p VALUES (1)").ok) return Result.err("insert p");
+		if (!db.run("INSERT INTO c VALUES (1)").ok) return Result.err("insert c");
 		return Result.ok(null);
 	}, message);
 	assert next.ok, next.ok ? "" : next.error;
 	assert count(db, "SELECT COUNT(*) AS n FROM c") == 1;
 }
 
+// A database whose native connection the test keeps, so it can lower sqlite's SQL length limit
+// inside a transaction: a ROLLBACK not cached yet then fails to prepare with TooBig and the
+// transaction stays open, the state a failed outermost rollback leaves.
+function memoryKeeping(out pointer: Ptr<sqlite3>): Database {
+	const rc = msqOpen(":memory:", OPEN_READWRITE_CREATE, out pointer);
+	if (rc != 0) throw new Error(`sqlite3_open_v2 returned ${rc}`);
+	return new Database(":memory:", new Connection(pointer), 64);
+}
+
+function stopped(): SqliteError {
+	return { code: ErrorCode.Abort, extended: 4, message: "the body stops", sql: "" };
+}
+
+const BROKEN_BY_TOO_BIG = "a failed rollback left a transaction open " +
+	"(string or blob too big); close the database";
+
+function refusedAsBroken<T>(r: Result<T, SqliteError>): boolean {
+	return !r.ok && r.error.code == ErrorCode.Misuse && r.error.message == BROKEN_BY_TOO_BIG;
+}
+
+// The first operation a broken database still accepts, or null when it refuses them all.
+function acceptedWhileBroken(db: Database): string | null {
+	if (!refusedAsBroken(db.run("INSERT INTO t VALUES (9)"))) return "run";
+	if (!refusedAsBroken(db.run("INSERT INTO t VALUES (?)", [Param.integer(9)]))) return "run ?";
+	if (!refusedAsBroken(db.get<Count>("SELECT COUNT(*) AS n FROM t"))) return "get";
+	if (!refusedAsBroken(db.all<Count>("SELECT COUNT(*) AS n FROM t"))) return "all";
+	if (!refusedAsBroken(db.allJson("SELECT 1"))) return "allJson";
+	if (!refusedAsBroken(db.exec("ROLLBACK"))) return "exec";
+	if (!refusedAsBroken(db.prepare("ROLLBACK"))) return "prepare";
+	if (!refusedAsBroken(db.migrate(["CREATE TABLE a (x)"]))) return "migrate";
+	const tx = db.transaction<void>((): Result<void, SqliteError> => Result.ok(null));
+	if (!refusedAsBroken(tx)) return "transaction";
+	return null;
+}
+
+test "a failed outermost rollback after a failed body breaks the database until close" {
+	let pointer: Ptr<sqlite3>;
+	const db = memoryKeeping(out pointer);
+	assert db.exec("CREATE TABLE t (n)").ok;
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
+	const r = db.transaction<void>((): Result<void, SqliteError> => {
+		try db.run("INSERT INTO t VALUES (1)");
+		sqliteLimit(pointer, SQLITE_LIMIT_SQL_LENGTH, 5);
+		return Result.err(stopped());
+	});
+	assert !r.ok && r.error.code == ErrorCode.TooBig && r.error.sql == "ROLLBACK";
+	const accepted = acceptedWhileBroken(db);
+	assert accepted == null, `${accepted} ran on a broken database`;
+	assert db.isOpen && db.close().ok && !db.isOpen;
+}
+
+test "a failed outermost rollback after a failed commit breaks the database until close" {
+	let pointer: Ptr<sqlite3>;
+	const db = memoryKeeping(out pointer);
+	assert db.exec("CREATE TABLE t (n)").ok;
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
+	const r = db.transaction<void>((): Result<void, SqliteError> => {
+		try db.run("INSERT INTO t VALUES (1)");
+		sqliteLimit(pointer, SQLITE_LIMIT_SQL_LENGTH, 5);
+		return Result.ok(null);
+	});
+	assert !r.ok && r.error.code == ErrorCode.TooBig && r.error.sql == "ROLLBACK";
+	const accepted = acceptedWhileBroken(db);
+	assert accepted == null, `${accepted} ran on a broken database`;
+	assert db.isOpen && db.close().ok && !db.isOpen;
+}
+
+test "a failed outermost rollback after a throwing body breaks the database until close" {
+	let pointer: Ptr<sqlite3>;
+	const db = memoryKeeping(out pointer);
+	assert db.exec("CREATE TABLE t (n)").ok;
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
+	let caught = false;
+	try {
+		db.transaction((): Result<void, string> => {
+			db.run("INSERT INTO t VALUES (1)");
+			sqliteLimit(pointer, SQLITE_LIMIT_SQL_LENGTH, 5);
+			throw new Error("boom");
+		}, message);
+	} catch (e) {
+		caught = true;
+	}
+	assert caught;
+	const accepted = acceptedWhileBroken(db);
+	assert accepted == null, `${accepted} ran on a broken database`;
+	assert db.isOpen && db.close().ok && !db.isOpen;
+}
+
+test "a failed savepoint rollback leaves the database usable once the outer level rolls back" {
+	let pointer: Ptr<sqlite3>;
+	const db = memoryKeeping(out pointer);
+	assert db.exec("CREATE TABLE t (n)").ok;
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
+	let previous: int32 = 0;
+	const outer = db.transaction<void>((): Result<void, SqliteError> => {
+		try db.run("INSERT INTO t VALUES (1)");
+		return db.transaction<void>((): Result<void, SqliteError> => {
+			try db.run("INSERT INTO t VALUES (2)");
+			previous = sqliteLimit(pointer, SQLITE_LIMIT_SQL_LENGTH, 10);
+			return Result.err(stopped());
+		});
+	});
+	assert !outer.ok && outer.error.code == ErrorCode.TooBig;
+	assert outer.error.sql == "ROLLBACK TO msq_1";
+	sqliteLimit(pointer, SQLITE_LIMIT_SQL_LENGTH, previous);
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 0;
+	assert db.run("INSERT INTO t VALUES (3)").ok;
+	assert count(db, "SELECT COUNT(*) AS n FROM t") == 1;
+	assert db.close().ok;
+}
+
 // Statement cache
 
-test "the same SQL run inside its own each visitor works and leaves one cached statement" {
+test "the same SQL run inside its own iterate visitor works and leaves one cached statement" {
 	const db = memory();
 	const sql = "SELECT value AS n FROM json_each(?)";
 	let inner: int64 = 0;
 	let nestedRows: int32 = 0;
-	const r = db.each<Count>(sql, [text("[1,2,3]")], (outer: Count): void => {
-		const nested = db.each<Count>(sql, [text("[5,6]")], (row: Count): void => {
+	const r = db.iterate<Count>(sql, [Param.text("[1,2,3]")], (outer: Count): void => {
+		const nested = db.iterate<Count>(sql, [Param.text("[5,6]")], (row: Count): void => {
 			inner += row.n * outer.n;
 		});
 		if (nested.ok) nestedRows += nested.value;
@@ -547,7 +671,7 @@ test "the same SQL run inside its own each visitor works and leaves one cached s
 	assert r.ok && r.value == 3;
 	assert nestedRows == 6 && inner == 66;
 	assert db.openStatements() == 1;
-	const again = db.query<Count>(sql, [text("[7]")]);
+	const again = db.all<Count>(sql, [Param.text("[7]")]);
 	assert again.ok && again.value.length == 1 && again.value[0].n == 7;
 }
 
@@ -556,23 +680,23 @@ test "a visitor that throws releases the cached statement for the next caller" {
 	const sql = "SELECT value AS n FROM json_each('[1,2,3]')";
 	let caught = false;
 	try {
-		db.each<Count>(sql, [], (row: Count): void => {
+		db.iterate<Count>(sql, (row: Count): void => {
 			throw new Error("visitor");
 		});
 	} catch (e) {
 		caught = true;
 	}
 	assert caught;
-	const r = db.query<Count>(sql, []);
+	const r = db.all<Count>(sql);
 	assert r.ok && r.value.length == 3;
 	assert db.openStatements() == 1;
 }
 
 test "a decode failure does not leak into the next use of the cached statement" {
 	const db = memory();
-	const bad = db.query<Small>("SELECT ? AS n", [integer(5000000000)]);
+	const bad = db.all<Small>("SELECT ? AS n", [Param.integer(5000000000)]);
 	assert !bad.ok && bad.error.code == ErrorCode.OutOfRange;
-	const good = db.query<Small>("SELECT ? AS n", [integer(5)]);
+	const good = db.all<Small>("SELECT ? AS n", [Param.integer(5)]);
 	assert good.ok && good.value[0].n == 5;
 }
 
@@ -602,7 +726,7 @@ test "a Statement outliving its Database still steps and reads" {
 
 test "a Statement outliving its Database reports errors through the closing connection" {
 	const stmt = orphanStatement();
-	const r = stmt.bind(9, integer(1));
+	const r = stmt.bind(9, Param.integer(1));
 	assert !r.ok && r.error.code == ErrorCode.Range && r.error.message != "";
 }
 
@@ -620,7 +744,7 @@ test "a Database dropped without close() while its Statement is alive" {
 	{
 		const db = memory();
 		assert db.exec("CREATE TABLE t (n); INSERT INTO t VALUES (1)").ok;
-		assert db.query<Count>("SELECT n FROM t", []).ok;
+		assert db.all<Count>("SELECT n FROM t").ok;
 		const p = db.prepare("SELECT COUNT(*) FROM t");
 		assert p.ok;
 		stmt = p.value;

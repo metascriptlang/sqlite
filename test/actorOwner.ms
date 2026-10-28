@@ -42,9 +42,8 @@ actor Samples {
 		if (failure != null) return Result.err(failure);
 		const db = this.db;
 		if (db == null) return Result.err("the database is not open");
-		const found = db.queryOne<Sample>(
+		const found = db.get<Sample>(
 			"SELECT host, busy FROM samples ORDER BY busy DESC LIMIT 1",
-			[],
 		);
 		return found.ok ? Result.ok(found.value) : Result.err(found.error.toString());
 	}

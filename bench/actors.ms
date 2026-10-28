@@ -1,6 +1,6 @@
 // Direct calls against actors on one WAL file: per-call latency, pipelined CALLs, group commit
 // behind a SEND, and reads spread over several reader actors. `msc run --release bench/actors.ms`.
-import { Database, SqliteError, integer, named } from "../src/index";
+import { Database, Param, SqliteError, named } from "../src/index";
 import { remove } from "std/fs";
 
 const ROWS: int32 = 20000;
@@ -35,7 +35,8 @@ function rowFor(id: int32): Row {
 }
 
 function busyOf(db: Database, id: int64): float64 {
-	const row = must(db.queryOne<Row>("SELECT id, host, busy FROM samples WHERE id = ?", [integer(id)]));
+	const sql = "SELECT id, host, busy FROM samples WHERE id = ?";
+	const row = must(db.get<Row>(sql, [Param.integer(id)]));
 	return row == null ? -1.0 : row.busy;
 }
 
@@ -47,11 +48,11 @@ actor Reader {
 	}
 	getMany(first: int32, count: int32): float64 {
 		let total = 0.0;
-		must(this.db.run("BEGIN", []));
+		must(this.db.run("BEGIN"));
 		for (let i: int32 = 0; i < count; i++) {
 			total += busyOf(this.db, ((first + i) % ROWS + 1) as int64);
 		}
-		must(this.db.run("COMMIT", []));
+		must(this.db.run("COMMIT"));
 		return total;
 	}
 }
@@ -61,16 +62,16 @@ actor Writer {
 	private pending: int32 = 0;
 	constructor(path: string) { this.db = openFile(path); }
 	record(row: Row): void {
-		if (this.pending == 0) must(this.db.run("BEGIN IMMEDIATE", []));
+		if (this.pending == 0) must(this.db.run("BEGIN IMMEDIATE"));
 		must(this.db.run("INSERT INTO samples VALUES (:id, :host, :busy)", named(row)));
 		this.pending += 1;
 		if (this.pending == BATCH) {
-			must(this.db.run("COMMIT", []));
+			must(this.db.run("COMMIT"));
 			this.pending = 0;
 		}
 	}
 	flush(): int32 {
-		if (this.pending > 0) must(this.db.run("COMMIT", []));
+		if (this.pending > 0) must(this.db.run("COMMIT"));
 		this.pending = 0;
 		return 0;
 	}
@@ -124,18 +125,18 @@ async function reads(): Promise<void> {
 	const path = scratch("read");
 	const db = openFile(path);
 	createSchema(db);
-	must(db.run("BEGIN", []));
+	must(db.run("BEGIN"));
 	for (let i: int32 = 1; i <= ROWS; i++) {
 		must(db.run("INSERT INTO samples VALUES (:id, :host, :busy)", named(rowFor(i))));
 	}
-	must(db.run("COMMIT", []));
+	must(db.run("COMMIT"));
 
 	let started = performance.now();
 	let total = 0.0;
 	for (let i: int32 = 0; i < READS; i++) {
-		const row = must(db.queryOne<Row>(
+		const row = must(db.get<Row>(
 			"SELECT id, host, busy FROM samples WHERE id = ?",
-			[integer((i % ROWS + 1) as int64)],
+			[Param.integer((i % ROWS + 1) as int64)],
 		));
 		if (row != null) total += row.busy;
 	}

@@ -4,7 +4,7 @@ SQLite for [MetaScript](https://github.com/metascriptlang): rows decode straight
 structs, every failure is a `Result`, and the database engine ships inside the package.
 
 ```ts
-import { Database, SqliteError, integer, named, real } from "sqlite/src/index";
+import { Database, Param, SqliteError, named } from "sqlite/src/index";
 
 struct Host {
 	name: string;
@@ -19,14 +19,14 @@ function inventory(): Result<void, SqliteError> {
 	const web: Host = { name: "web-1", cores: 8, busy: 0.25 };
 	try db.run("INSERT INTO hosts VALUES (:name, :cores, :busy)", named(web));
 
-	const idle = try db.query<Host>("SELECT * FROM hosts WHERE busy < ?", [real(0.5)]);
-	const big = try db.queryOne<Host>("SELECT * FROM hosts WHERE cores >= ?", [integer(4)]);
+	const idle = try db.all<Host>("SELECT * FROM hosts WHERE busy < ?", [Param.real(0.5)]);
+	const big = try db.get<Host>("SELECT * FROM hosts WHERE cores >= ?", [Param.integer(4)]);
 	if (big != null) console.log(`${idle.length} idle, ${big.name} has the cores`);
 	return Result.ok(null);
 }
 ```
 
-`query<Host>` is checked when it compiles: the decoder for `Host` is generated from the
+`all<Host>` is checked when it compiles: the decoder for `Host` is generated from the
 struct's field types, and a struct field the result set does not have fails the query with
 `MissingColumn` instead of becoming a default.
 
@@ -62,24 +62,33 @@ A NULL in a field that is not `T | null` is refused rather than turned into `0` 
 `uint64` is refused at compile time because SQLite integers are signed 64-bit.
 
 **Parameters, by position or by name.** Positional values carry their storage class:
-`integer(42)`, `real(0.5)`, `text("x")`, `blob(bytes)`, `nullParam()`, and
-`maybe<int64>(value, integer)` for a value that may be null. `named(value)` binds a struct's
-fields to `:name`, `@name` or `$name` parameters. A parameter with no field, or a field with
-no parameter, is an error, so a typo in either place cannot pass silently. `NaN` is refused
-because SQLite would store it as NULL.
+`Param.integer(42)`, `Param.real(0.5)`, `Param.text("x")`, `Param.blob(bytes)`, `Param.null()`,
+and `Param.maybe<int64>(value, (n: int64): Param => Param.integer(n))` for a value that may be
+null. `named(value)` binds a struct's fields to `:name`, `@name` or `$name` parameters. A
+parameter with no field, or a field with no parameter, is an error, so a typo in either place
+cannot pass silently. A statement without parameters takes none (`db.run("DELETE FROM hosts")`),
+and one that has parameters is refused when they are not given. `NaN` is refused because SQLite
+would store it as NULL.
 
 **Transactions that nest.** `transaction` runs `BEGIN IMMEDIATE` at the outermost level and a
 `SAVEPOINT` inside another one. A body that returns an error or throws rolls back to where it
 began:
 
 ```ts
-const reset = db.transaction<int64, SqliteError>(() => {
-	const updated = try db.run("UPDATE hosts SET busy = 0 WHERE busy > ?", [real(0.9)]);
+const reset = db.transaction<int64>((): Result<int64, SqliteError> => {
+	const updated = try db.run("UPDATE hosts SET busy = 0 WHERE busy > ?", [Param.real(0.9)]);
 	return Result.ok(updated.changes);
-}, (error) => error);
+});
 ```
 
-The second argument turns a failure to begin, commit or roll back into your error type.
+A body with its own error type passes a second argument that turns a failure to begin, commit
+or roll back into that type: `db.transaction<int64, string>(body, (error) => error.toString())`.
+
+If the outermost rollback itself fails and leaves the transaction open, the database refuses every
+later call with `Misuse` ("a failed rollback left a transaction open (…); close the database"),
+because the next statement would otherwise run inside the transaction that was meant to be gone.
+`close()` still closes it, and closing rolls the open transaction back. A failed rollback of a
+nested transaction does not break the database, because the outer level still rolls back.
 
 **Migrations.** `migrate(steps)` brings the schema to version `steps.length` using
 `PRAGMA user_version`. Each step and its version bump commit together, so a failed step leaves
@@ -93,7 +102,7 @@ try db.migrate([
 ]);
 ```
 
-**Rows as JSON.** `queryJson` returns the rows as a JSON array, for an endpoint that forwards
+**Rows as JSON.** `allJson` returns the rows as a JSON array, for an endpoint that forwards
 them unchanged. INTEGER becomes a number, BLOB a base64 string.
 
 **A statement cache.** Every query method reuses a prepared statement per SQL text (64 by
@@ -141,7 +150,7 @@ actor Samples {
 	busiest(): Result<Sample | null, SqliteError> {       // a CALL: await the reply
 		const db = this.db;
 		if (db == null) return Result.ok(null);
-		return db.queryOne<Sample>("SELECT host, busy FROM samples ORDER BY busy DESC LIMIT 1", []);
+		return db.get<Sample>("SELECT host, busy FROM samples ORDER BY busy DESC LIMIT 1");
 	}
 }
 ```
@@ -163,21 +172,21 @@ does the same work directly against the same amalgamation with the same flags
 |---|---|---|---|
 | INSERT, positional parameters, one transaction | 506 ns | 204 ns | 2.5× |
 | INSERT, `named(...)` | 715 ns | 203 ns | 3.5× |
-| `query<T>`, per row | 246 ns | 104 ns | 2.4× |
-| `queryOne<T>` by primary key | 855 ns | 477 ns | 1.8× |
-| `queryJson`, per row | 429 µs | 459 ns | see below |
+| `all<T>`, per row | 246 ns | 104 ns | 2.4× |
+| `get<T>` by primary key | 855 ns | 477 ns | 1.8× |
+| `allJson`, per row | 429 µs | 459 ns | see below |
 
 Group commit through an actor, WAL file, 20 000 rows (`bench/actors.ms`): 16.2 µs per row with
 a commit per row, 1.7 µs per row with one writer actor committing every 256 rows (9.5×).
 
 Known gaps, each traced to its cause:
 
-- `queryJson` is quadratic in the result size because of a compiler issue: appending the result
+- `allJson` is quadratic in the result size because of a compiler issue: appending the result
   of a `try` expression to a string copies the whole string. Writing the cell into a local first
   measures 642 ns per row (1.4× C). The fix belongs in the compiler, so the library waits for it.
 - A prepared statement remembers the column positions of the struct it last decoded and the names
   of its parameters, and resolves them again only after SQLite recompiles it for a schema change.
-  That halved `queryOne`; most of what remains is the statement cache lookup and string copies.
+  That halved `get`; most of what remains is the statement cache lookup and string copies.
 - Reader actors do not yet read in parallel: actors created on the main thread currently share
   one scheduler, so eight reader actors read no faster than one. The runtime fix is designed;
   `spawn` already scales across cores.
@@ -193,7 +202,10 @@ and the SQL that failed. Decoding adds three codes of its own: `MissingColumn`, 
 `OutOfRange`.
 
 ```ts
-const inserted = db.run("INSERT INTO hosts VALUES (?, ?, ?)", [text("web-1"), integer(8), real(0)]);
+const inserted = db.run(
+	"INSERT INTO hosts VALUES (?, ?, ?)",
+	[Param.text("web-1"), Param.integer(8), Param.real(0)],
+);
 if (!inserted.ok && inserted.error.code == ErrorCode.Constraint) {
 	console.log(`already there: ${inserted.error.message}`);
 }
@@ -206,9 +218,10 @@ if (!inserted.ok && inserted.error.code == ErrorCode.Constraint) {
   arrive when an application needs them.
 - A struct field must have the column's name; alias the column (`SELECT count(*) AS n`) when it
   does not.
-- A call with no parameters still passes `[]`, and named values go through `named(...)` instead
-  of a plain object. Both wait on a compiler fix for an empty array literal passed to a generic
-  parameter.
+- Named values go through `named(...)` instead of a plain object. A plain object waits on a
+  compiler fix for an empty array literal passed to a generic parameter.
+- `Param.maybe(value, Param.integer)` does not compile yet: a static extension passed as a
+  function value is a compiler bug. Pass an arrow, as above.
 
 ## Development
 

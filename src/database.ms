@@ -7,7 +7,7 @@ import {
 } from "./native/sqlite.h";
 import { Connection, SQLITE_OK, StatementHandle, codeFailure, failure, misuse } from "./native";
 import { ErrorCode, SqliteError, errorCodeOf } from "./error";
-import { Named, Param, blob, integer, maybe, named, nullParam, real, text } from "./param";
+import { Named, Param, named } from "./param";
 import { ColumnKind, Statement } from "./statement";
 import { exists, remove } from "std/fs";
 import { rowDecode, rowFields } from "./decode";
@@ -78,6 +78,8 @@ export class Database {
 	private mostRecent: Statement | null = null;
 	private cacheSize: int32;
 	private depth: int32 = 0;
+	// The failed outermost rollback that left a transaction open; only close() runs after it.
+	private brokenBy: SqliteError | null = null;
 
 	constructor(path: string, connection: Connection, cacheSize: int32) {
 		this.path = path;
@@ -127,6 +129,12 @@ export class Database {
 	private live(sql: string): Result<Ptr<sqlite3>, SqliteError> {
 		const pointer = this.connection.pointer;
 		if (pointer == null) return Result.err(misuse("the database is closed", sql));
+		const broken = this.brokenBy;
+		if (broken != null) {
+			const left = `a failed rollback left a transaction open (${broken.message}); ` +
+				"close the database";
+			return Result.err(misuse(left, sql));
+		}
 		return Result.ok(pointer);
 	}
 
@@ -180,6 +188,7 @@ export class Database {
 	// The cached statement for `sql`, or a fresh one while the cached one is in use. The cache
 	// keeps use order, so eviction takes the least recently used statement.
 	private acquire(sql: string): Result<Statement, SqliteError> {
+		try this.live(sql);
 		const hit = this.cache.get(sql);
 		if (hit != null && !this.stepping.has(sql)) {
 			this.stepping.add(sql);
@@ -224,8 +233,12 @@ export class Database {
 		stmt.clearBindings();
 	}
 
-	// Runs one statement to completion. Every query method takes either `Param` values bound in
-	// order or `named(...)` values bound to the parameters of the same names.
+	// Runs one statement to completion. Every query method takes no parameters, `Param` values
+	// bound in order, or `named(...)` values bound to the parameters of the same names.
+	run(sql: string): Result<RunResult, SqliteError> {
+		return this.runWith<Readonly<Span<Param>>>(sql, []);
+	}
+
 	run(sql: string, params: Readonly<Span<Param>>): Result<RunResult, SqliteError> {
 		return this.runWith<Readonly<Span<Param>>>(sql, params);
 	}
@@ -235,48 +248,64 @@ export class Database {
 	}
 
 	// Every row as JSON text (see rowsJson) for an endpoint that forwards rows unchanged.
-	queryJson(sql: string, params: Readonly<Span<Param>>): Result<string, SqliteError> {
-		return this.queryJsonWith<Readonly<Span<Param>>>(sql, params);
+	allJson(sql: string): Result<string, SqliteError> {
+		return this.allJsonWith<Readonly<Span<Param>>>(sql, []);
 	}
 
-	queryJson(sql: string, params: Readonly<Named>): Result<string, SqliteError> {
-		return this.queryJsonWith<Readonly<Named>>(sql, params);
+	allJson(sql: string, params: Readonly<Span<Param>>): Result<string, SqliteError> {
+		return this.allJsonWith<Readonly<Span<Param>>>(sql, params);
+	}
+
+	allJson(sql: string, params: Readonly<Named>): Result<string, SqliteError> {
+		return this.allJsonWith<Readonly<Named>>(sql, params);
 	}
 
 	// Every row decoded into `T`: each field from the column of its name, with its storage
 	// class and range checked; the first failed read fails the query.
-	query<T>(sql: string, params: Readonly<Span<Param>>): Result<T[], SqliteError> {
-		return this.queryWith<T, Readonly<Span<Param>>>(sql, params);
+	all<T>(sql: string): Result<T[], SqliteError> {
+		return this.allWith<T, Readonly<Span<Param>>>(sql, []);
 	}
 
-	query<T>(sql: string, params: Readonly<Named>): Result<T[], SqliteError> {
-		return this.queryWith<T, Readonly<Named>>(sql, params);
+	all<T>(sql: string, params: Readonly<Span<Param>>): Result<T[], SqliteError> {
+		return this.allWith<T, Readonly<Span<Param>>>(sql, params);
+	}
+
+	all<T>(sql: string, params: Readonly<Named>): Result<T[], SqliteError> {
+		return this.allWith<T, Readonly<Named>>(sql, params);
 	}
 
 	// The first row decoded into `T`, or null when there is none.
-	queryOne<T>(sql: string, params: Readonly<Span<Param>>): Result<T | null, SqliteError> {
-		return this.queryOneWith<T, Readonly<Span<Param>>>(sql, params);
+	get<T>(sql: string): Result<T | null, SqliteError> {
+		return this.getWith<T, Readonly<Span<Param>>>(sql, []);
 	}
 
-	queryOne<T>(sql: string, params: Readonly<Named>): Result<T | null, SqliteError> {
-		return this.queryOneWith<T, Readonly<Named>>(sql, params);
+	get<T>(sql: string, params: Readonly<Span<Param>>): Result<T | null, SqliteError> {
+		return this.getWith<T, Readonly<Span<Param>>>(sql, params);
+	}
+
+	get<T>(sql: string, params: Readonly<Named>): Result<T | null, SqliteError> {
+		return this.getWith<T, Readonly<Named>>(sql, params);
 	}
 
 	// Decodes each row into `T` and hands it to `visit` without collecting them.
-	each<T>(
+	iterate<T>(sql: string, visit: (row: T) => void): Result<int32, SqliteError> {
+		return this.iterateWith<T, Readonly<Span<Param>>>(sql, [], visit);
+	}
+
+	iterate<T>(
 		sql: string,
 		params: Readonly<Span<Param>>,
 		visit: (row: T) => void,
 	): Result<int32, SqliteError> {
-		return this.eachWith<T, Readonly<Span<Param>>>(sql, params, visit);
+		return this.iterateWith<T, Readonly<Span<Param>>>(sql, params, visit);
 	}
 
-	each<T>(
+	iterate<T>(
 		sql: string,
 		params: Readonly<Named>,
 		visit: (row: T) => void,
 	): Result<int32, SqliteError> {
-		return this.eachWith<T, Readonly<Named>>(sql, params, visit);
+		return this.iterateWith<T, Readonly<Named>>(sql, params, visit);
 	}
 
 	// Acquires the statement for `sql`, binds `params` and hands it to `use`; the statement goes
@@ -325,11 +354,11 @@ export class Database {
 		});
 	}
 
-	private queryJsonWith<P>(sql: string, params: P): Result<string, SqliteError> {
+	private allJsonWith<P>(sql: string, params: P): Result<string, SqliteError> {
 		return this.withStatement<P, string>(sql, params, rowsJson);
 	}
 
-	private queryWith<T, P>(sql: string, params: P): Result<T[], SqliteError> {
+	private allWith<T, P>(sql: string, params: P): Result<T[], SqliteError> {
 		const rows: T[] = [];
 		try this.decodeRows<T, P>(sql, params, (row) => {
 			rows.push(row);
@@ -338,7 +367,7 @@ export class Database {
 		return Result.ok(rows);
 	}
 
-	private queryOneWith<T, P>(sql: string, params: P): Result<T | null, SqliteError> {
+	private getWith<T, P>(sql: string, params: P): Result<T | null, SqliteError> {
 		let found: T | null = null;
 		try this.decodeRows<T, P>(sql, params, (row) => {
 			found = row;
@@ -347,7 +376,7 @@ export class Database {
 		return Result.ok(found);
 	}
 
-	private eachWith<T, P>(
+	private iterateWith<T, P>(
 		sql: string,
 		params: P,
 		visit: (row: T) => void,
@@ -363,7 +392,7 @@ export class Database {
 	// of the last one that succeeded. A database newer than `steps`, or at a negative version,
 	// is refused.
 	migrate(steps: Readonly<Span<string>>): Result<int32, SqliteError> {
-		const found = try this.queryOne<UserVersion>("PRAGMA user_version", []);
+		const found = try this.get<UserVersion>("PRAGMA user_version");
 		const current = found == null ? 0 : found.user_version;
 		if (current < 0 || current > steps.length) {
 			return Result.err({
@@ -377,36 +406,46 @@ export class Database {
 		for (let version = current; version < steps.length; version++) {
 			const sql = steps[version];
 			const next = version + 1;
-			try this.transaction<void, SqliteError>((): Result<void, SqliteError> => {
+			try this.transaction<void>((): Result<void, SqliteError> => {
 				try this.exec(sql);
 				return this.exec(`PRAGMA user_version = ${next}`);
-			}, (error: SqliteError): SqliteError => error);
+			});
 		}
 		return Result.ok(steps.length);
 	}
 
+	// Rolls back to where the transaction at `depth` began. A failed outermost rollback that
+	// leaves the transaction open breaks the database (see live), because the next statement
+	// would otherwise run inside the transaction that was meant to be gone.
 	private undo(depth: int32): Result<void, SqliteError> {
 		const pointer = this.connection.pointer;
 		if (pointer == null || msqAutocommit(pointer) != 0) return Result.ok(null);
-		if (depth == 0) {
-			try this.run("ROLLBACK", []);
+		if (depth > 0) {
+			try this.run(`ROLLBACK TO msq_${depth}`);
+			try this.run(`RELEASE msq_${depth}`);
 			return Result.ok(null);
 		}
-		try this.run(`ROLLBACK TO msq_${depth}`, []);
-		try this.run(`RELEASE msq_${depth}`, []);
-		return Result.ok(null);
+		const rollback = this.run("ROLLBACK");
+		if (rollback.ok) return Result.ok(null);
+		if (msqAutocommit(pointer) == 0) this.brokenBy = rollback.error;
+		return Result.err(rollback.error);
 	}
 
 	// Runs `body` in a transaction: BEGIN IMMEDIATE at the outermost level, a SAVEPOINT inside
-	// another. A failed or throwing body rolls back to where it began; `fromSqlite` turns a
-	// failure to begin, commit or roll back into the body's error type. A failed rollback is
+	// another. A failed or throwing body rolls back to where it began. A failed rollback is
 	// returned in place of the body's error, because it leaves the transaction open.
+	transaction<T>(body: () => Result<T, SqliteError>): Result<T, SqliteError> {
+		return this.transaction<T, SqliteError>(body, sameError);
+	}
+
+	// The same for a body with its own error type; `fromSqlite` turns a failure to begin, commit
+	// or roll back into it.
 	transaction<T, E>(
 		body: () => Result<T, E>,
 		fromSqlite: (error: SqliteError) => E,
 	): Result<T, E> {
 		const depth = this.depth;
-		const begin = this.run(depth == 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT msq_${depth}`, []);
+		const begin = this.run(depth == 0 ? "BEGIN IMMEDIATE" : `SAVEPOINT msq_${depth}`);
 		if (!begin.ok) return Result.err(fromSqlite(begin.error));
 		this.depth = depth + 1;
 		let open = true;
@@ -424,13 +463,17 @@ export class Database {
 			if (!undone.ok) return Result.err(fromSqlite(undone.error));
 			return result;
 		}
-		const commit = this.run(depth == 0 ? "COMMIT" : `RELEASE msq_${depth}`, []);
+		const commit = this.run(depth == 0 ? "COMMIT" : `RELEASE msq_${depth}`);
 		if (!commit.ok) {
 			const undone = this.undo(depth);
 			return Result.err(fromSqlite(undone.ok ? commit.error : undone.error));
 		}
 		return result;
 	}
+}
+
+function sameError(error: SqliteError): SqliteError {
+	return error;
 }
 
 function memory(): Database {
@@ -465,19 +508,22 @@ test "every parameter type binds with its exact storage class" {
 	const bytes: uint8[] = [0, 1, 255, 0];
 	const big: int64 = 9223372036854775807;
 	const ins = db.run("INSERT INTO v VALUES (?, ?, ?, ?, ?)", [
-		integer(big), real(2.5), text("é🚀\nx"), blob(bytes), nullParam(),
+		Param.integer(big),
+		Param.real(2.5),
+		Param.text("é🚀\nx"),
+		Param.blob(bytes),
+		Param.null(),
 	]);
 	assert ins.ok && ins.value.changes == 1 && ins.value.lastInsertRowid == 1;
-	const kinds = db.queryOne<Kinds>(
+	const kinds = db.get<Kinds>(
 		"SELECT typeof(i) AS ti, typeof(r) AS tr, typeof(t) AS tt, typeof(b) AS tb, " +
 			"typeof(n) AS tn FROM v",
-		[],
 	);
 	assert kinds.ok && kinds.value != null;
 	const k = kinds.value;
 	assert k.ti == "integer" && k.tr == "real" && k.tt == "text";
 	assert k.tb == "blob" && k.tn == "null";
-	const rows = db.query<Typed>("SELECT i, r, t, b, n FROM v", []);
+	const rows = db.all<Typed>("SELECT i, r, t, b, n FROM v");
 	assert rows.ok && rows.value.length == 1;
 	const row = rows.value[0];
 	assert row.i == big && row.r == 2.5 && row.t == "é🚀\nx" && row.n == null;
@@ -505,11 +551,11 @@ test "named values bind each field to the parameter of its name, by any prefix" 
 	const s: Sample = { host: "web-1", busy: 0.25, cores: 8, up: true, note: null };
 	const ins = db.run("INSERT INTO s VALUES (:host, @busy, $cores, :up, :note)", named(s));
 	assert ins.ok && ins.value.changes == 1;
-	const rows = db.query<Sample>("SELECT * FROM s WHERE host = :host", named({ host: "web-1" }));
+	const rows = db.all<Sample>("SELECT * FROM s WHERE host = :host", named({ host: "web-1" }));
 	assert rows.ok && rows.value.length == 1;
 	const row = rows.value[0];
 	assert row.host == "web-1" && row.busy == 0.25 && row.cores == 8 && row.up && row.note == null;
-	const one = db.queryOne<HostBusy>(
+	const one = db.get<HostBusy>(
 		"SELECT host, busy FROM s WHERE busy < :limit AND cores >= :cores",
 		named({ limit: 0.5, cores: 4 }),
 	);
@@ -539,7 +585,7 @@ struct CompileOption {
 
 test "the amalgamation is built with its flags" {
 	const db = memory();
-	const options = db.query<CompileOption>("PRAGMA compile_options", []);
+	const options = db.all<CompileOption>("PRAGMA compile_options");
 	assert options.ok;
 	const names = options.value.map((o: CompileOption): string => o.compile_options);
 	for (const wanted of ["DQS=0", "ENABLE_FTS5", "OMIT_LOAD_EXTENSION", "DEFAULT_FOREIGN_KEYS"]) {
@@ -552,10 +598,10 @@ test "foreign keys are enforced unless the connection turns them off" {
 	const db = memory();
 	assert db.exec("CREATE TABLE host (name TEXT PRIMARY KEY); " +
 		"CREATE TABLE pick (host TEXT REFERENCES host (name))").ok;
-	const orphan = db.run("INSERT INTO pick VALUES (?)", [text("nowhere")]);
+	const orphan = db.run("INSERT INTO pick VALUES (?)", [Param.text("nowhere")]);
 	assert !orphan.ok && orphan.error.code == ErrorCode.Constraint;
 	assert db.exec("PRAGMA foreign_keys = OFF").ok;
-	assert db.run("INSERT INTO pick VALUES (?)", [text("nowhere")]).ok;
+	assert db.run("INSERT INTO pick VALUES (?)", [Param.text("nowhere")]).ok;
 	assert db.close().ok;
 }
 
@@ -567,7 +613,7 @@ test "migrate runs each step past the recorded version once" {
 	assert db.migrate(steps).ok;
 	const grown = db.migrate([...steps, "ALTER TABLE a ADD COLUMN z"]);
 	assert grown.ok && grown.value == 3;
-	assert db.run("INSERT INTO a (x, z) VALUES (1, 2)", []).ok;
+	assert db.run("INSERT INTO a (x, z) VALUES (1, 2)").ok;
 	assert db.close().ok;
 }
 
@@ -595,10 +641,14 @@ test "a negative schema version is refused, not used as a step index" {
 test "an empty text and an empty blob bind as values, not NULL" {
 	const db = memory();
 	const empty: uint8[] = [];
-	const kinds = db.queryOne<Kinds>(
+	const kinds = db.get<Kinds>(
 		"SELECT typeof(?1) AS ti, typeof(?2) AS tr, typeof(?1) AS tt, typeof(?2) AS tb, " +
 			"typeof(?3) AS tn",
-		[text(""), blob(empty), maybe<int64>(null, integer)],
+		[
+			Param.text(""),
+			Param.blob(empty),
+			Param.maybe<int64>(null, (n: int64): Param => Param.integer(n)),
+		],
 	);
 	assert kinds.ok && kinds.value != null;
 	assert kinds.value.ti == "text" && kinds.value.tr == "blob" && kinds.value.tn == "null";
@@ -614,10 +664,9 @@ struct Narrow {
 
 test "a decoded row reads every supported field type" {
 	const db = memory();
-	const rows = db.query<Narrow>(
+	const rows = db.all<Narrow>(
 		"SELECT -128 AS small, 2147483647 AS count, 1 AS flag, 7 AS ratio, NULL AS label " +
 			"UNION ALL SELECT 127, -2147483648, 0, 0.25, 'x'",
-		[],
 	);
 	assert rows.ok && rows.value.length == 2;
 	const a = rows.value[0];
@@ -628,13 +677,13 @@ test "a decoded row reads every supported field type" {
 
 function decodeError(sql: string): ErrorCode | null {
 	const db = memory();
-	const r = db.query<Narrow>(sql, []);
+	const r = db.all<Narrow>(sql);
 	return r.ok ? null : r.error.code;
 }
 
 test "a missing column is refused, naming the field and the columns" {
 	const db = memory();
-	const r = db.query<Narrow>("SELECT 1 AS small, 2 AS count, 1 AS flag, 1.0 AS ratio", []);
+	const r = db.all<Narrow>("SELECT 1 AS small, 2 AS count, 1 AS flag, 1.0 AS ratio");
 	assert !r.ok && r.error.code == ErrorCode.MissingColumn;
 	assert r.error.message.contains("label");
 	assert r.error.message.contains("small, count, flag, ratio");
@@ -666,9 +715,8 @@ test "an integer outside its field's range is refused, not wrapped" {
 		"SELECT 1 AS small, 2 AS count, 1 AS flag, 9007199254740993 AS ratio, NULL AS label",
 	) == ErrorCode.OutOfRange;
 	const db = memory();
-	const r = db.query<Narrow>(
+	const r = db.all<Narrow>(
 		"SELECT 1 AS small, 2147483648 AS count, 1 AS flag, 1.0 AS ratio, NULL AS label",
-		[],
 	);
 	assert !r.ok && r.error.message.contains("2147483648") && r.error.message.contains("count");
 }
@@ -677,21 +725,21 @@ test "the first failed row fails the query and the statement stays usable" {
 	const db = memory();
 	const sql = "SELECT value AS small, 1 AS count, 1 AS flag, 1.0 AS ratio, NULL AS label FROM " +
 		"(SELECT 1 AS value UNION ALL SELECT 999)";
-	const r = db.query<Narrow>(sql, []);
+	const r = db.all<Narrow>(sql);
 	assert !r.ok && r.error.code == ErrorCode.OutOfRange;
-	const again = db.query<Narrow>(sql + " WHERE value < 100", []);
+	const again = db.all<Narrow>(sql + " WHERE value < 100");
 	assert again.ok && again.value.length == 1;
 }
 
 struct Count { n: int64; }
 
-test "queryOne gives null for no row and the first row otherwise" {
+test "get gives null for no row and the first row otherwise" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n INTEGER)").ok;
-	const none = db.queryOne<Count>("SELECT n FROM t", []);
+	const none = db.get<Count>("SELECT n FROM t");
 	assert none.ok && none.value == null;
-	assert db.run("INSERT INTO t VALUES (?), (?)", [integer(4), integer(5)]).ok;
-	const first = db.queryOne<Count>("SELECT n FROM t ORDER BY n", []);
+	assert db.run("INSERT INTO t VALUES (?), (?)", [Param.integer(4), Param.integer(5)]).ok;
+	const first = db.get<Count>("SELECT n FROM t ORDER BY n");
 	assert first.ok && first.value != null && first.value.n == 4;
 }
 
@@ -709,10 +757,10 @@ test "one cached statement decodes into each struct by that struct's own columns
 	const db = memory();
 	const sql = "SELECT 1 AS a, 'x' AS b, 2.5 AS c";
 	for (let round: int32 = 0; round < 2; round++) {
-		const leading = db.queryOne<Leading>(sql, []);
+		const leading = db.get<Leading>(sql);
 		assert leading.ok && leading.value != null;
 		assert leading.value.a == 1 && leading.value.b == "x";
-		const trailing = db.queryOne<Trailing>(sql, []);
+		const trailing = db.get<Trailing>(sql);
 		assert trailing.ok && trailing.value != null;
 		assert trailing.value.b == "x" && trailing.value.c == 2.5;
 	}
@@ -729,15 +777,15 @@ test "a cached statement reads the columns of a table changed since its last run
 	const db = memory();
 	assert db.exec("CREATE TABLE t (a INTEGER, b TEXT); INSERT INTO t VALUES (1, 'x')").ok;
 	const sql = "SELECT * FROM t";
-	const before = db.queryOne<Leading>(sql, []);
+	const before = db.get<Leading>(sql);
 	assert before.ok && before.value != null && before.value.a == 1;
 	assert db.exec("DROP TABLE t; CREATE TABLE t (b TEXT, a INTEGER); " +
 		"INSERT INTO t VALUES ('y', 2)").ok;
-	const swapped = db.queryOne<Leading>(sql, []);
+	const swapped = db.get<Leading>(sql);
 	assert swapped.ok && swapped.value != null;
 	assert swapped.value.a == 2 && swapped.value.b == "y";
 	assert db.exec("ALTER TABLE t ADD COLUMN c REAL DEFAULT 0.5").ok;
-	const widened = db.queryOne<Widened>(sql, []);
+	const widened = db.get<Widened>(sql);
 	assert widened.ok && widened.value != null;
 	assert widened.value.a == 2 && widened.value.b == "y" && widened.value.c == 0.5;
 	assert db.isCached(sql);
@@ -749,23 +797,23 @@ test "named values bind by name whatever order a cached statement meets them in"
 	const sql = "INSERT INTO s VALUES (:host, :busy)";
 	assert db.run(sql, named({ host: "a", busy: 1.0 })).ok;
 	assert db.run(sql, named({ busy: 2.0, host: "b" })).ok;
-	const b = db.queryOne<HostBusy>("SELECT host, busy FROM s WHERE busy = 2", []);
+	const b = db.get<HostBusy>("SELECT host, busy FROM s WHERE busy = 2");
 	assert b.ok && b.value != null && b.value.host == "b";
 	assert countOf(db, "SELECT count(*) AS n FROM s WHERE host = 'a' AND busy = 1") == 1;
 }
 
-test "each visits rows without collecting them" {
+test "iterate visits rows without collecting them" {
 	const db = memory();
 	let total: int64 = 0;
 	const sql = "SELECT value AS n FROM json_each('[1,2,3]')";
-	const r = db.each<Count>(sql, [], (row: Count): void => {
+	const r = db.iterate<Count>(sql, (row: Count): void => {
 		total += row.n;
 	});
 	assert r.ok && r.value == 3 && total == 6;
 }
 
 function countOf(db: Database, sql: string): int64 {
-	const r = db.queryOne<Count>(sql, []);
+	const r = db.get<Count>(sql);
 	if (!r.ok || r.value == null) return -1;
 	return r.value.n;
 }
@@ -778,15 +826,32 @@ test "a transaction commits a successful body and rolls back a failed one" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n INTEGER)").ok;
 	const kept = db.transaction((): Result<int32, string> => {
-		if (!db.run("INSERT INTO t VALUES (1)", []).ok) return Result.err("insert");
+		if (!db.run("INSERT INTO t VALUES (1)").ok) return Result.err("insert");
 		return Result.ok(7);
 	}, sqliteMessage);
 	assert kept.ok && kept.value == 7;
 	const dropped = db.transaction((): Result<int32, string> => {
-		if (!db.run("INSERT INTO t VALUES (2)", []).ok) return Result.err("insert");
+		if (!db.run("INSERT INTO t VALUES (2)").ok) return Result.err("insert");
 		return Result.err("stop");
 	}, sqliteMessage);
 	assert !dropped.ok && dropped.error == "stop";
+	assert countOf(db, "SELECT COUNT(*) AS n FROM t") == 1;
+}
+
+test "a transaction over SqliteError takes no converter" {
+	const db = memory();
+	assert db.exec("CREATE TABLE t (n INTEGER UNIQUE)").ok;
+	const kept = db.transaction<int64>((): Result<int64, SqliteError> => {
+		const inserted = try db.run("INSERT INTO t VALUES (1)");
+		return Result.ok(inserted.lastInsertRowid);
+	});
+	assert kept.ok && kept.value == 1;
+	const dropped = db.transaction<void>((): Result<void, SqliteError> => {
+		try db.run("INSERT INTO t VALUES (2)");
+		try db.run("INSERT INTO t VALUES (1)");
+		return Result.ok(null);
+	});
+	assert !dropped.ok && dropped.error.code == ErrorCode.Constraint;
 	assert countOf(db, "SELECT COUNT(*) AS n FROM t") == 1;
 }
 
@@ -794,14 +859,14 @@ test "a nested transaction is a savepoint: its rollback keeps the outer work" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n INTEGER)").ok;
 	const outer = db.transaction((): Result<void, string> => {
-		if (!db.run("INSERT INTO t VALUES (1)", []).ok) return Result.err("outer insert");
+		if (!db.run("INSERT INTO t VALUES (1)").ok) return Result.err("outer insert");
 		const inner = db.transaction((): Result<void, string> => {
-			if (!db.run("INSERT INTO t VALUES (2)", []).ok) return Result.err("inner insert");
+			if (!db.run("INSERT INTO t VALUES (2)").ok) return Result.err("inner insert");
 			return Result.err("inner stops");
 		}, sqliteMessage);
 		if (inner.ok) return Result.err("the inner body should have failed");
 		const deeper = db.transaction((): Result<void, string> => {
-			if (!db.run("INSERT INTO t VALUES (3)", []).ok) return Result.err("deeper insert");
+			if (!db.run("INSERT INTO t VALUES (3)").ok) return Result.err("deeper insert");
 			return Result.ok(null);
 		}, sqliteMessage);
 		return deeper;
@@ -834,7 +899,7 @@ test "a throwing body rolls back and leaves no transaction open" {
 	let caught = false;
 	try {
 		db.transaction((): Result<void, string> => {
-			db.run("INSERT INTO t VALUES (1)", []);
+			db.run("INSERT INTO t VALUES (1)");
 			throw new Error("boom");
 		}, sqliteMessage);
 	} catch (e) {
@@ -849,7 +914,9 @@ test "a throwing body rolls back and leaves no transaction open" {
 test "the statement cache reuses one statement per SQL text" {
 	const db = memory();
 	assert db.exec("CREATE TABLE t (n INTEGER)").ok;
-	for (let i: int32 = 0; i < 10; i++) assert db.run("INSERT INTO t VALUES (?)", [integer(i)]).ok;
+	for (let i: int32 = 0; i < 10; i++) {
+		assert db.run("INSERT INTO t VALUES (?)", [Param.integer(i)]).ok;
+	}
 	assert db.openStatements() == 1;
 	assert countOf(db, "SELECT COUNT(*) AS n FROM t") == 10;
 	assert db.openStatements() == 2;
@@ -891,8 +958,8 @@ test "the same SQL run while its cached statement is stepping gets its own state
 	const db = memory();
 	const sql = "SELECT value AS n FROM json_each(?)";
 	let inner: int64 = 0;
-	const r = db.each<Count>(sql, [text("[1,2]")], (row: Count): void => {
-		const nested = db.query<Count>(sql, [text("[10,20]")]);
+	const r = db.iterate<Count>(sql, [Param.text("[1,2]")], (row: Count): void => {
+		const nested = db.all<Count>(sql, [Param.text("[10,20]")]);
 		if (nested.ok) for (const c of nested.value) inner += c.n * row.n;
 	});
 	assert r.ok && r.value == 2 && inner == 90;
@@ -905,7 +972,7 @@ test "close finalizes cached statements; later calls fail with Misuse" {
 	assert db.close().ok;
 	assert !db.isOpen;
 	assert db.close().ok;
-	const after = db.run("SELECT 1", []);
+	const after = db.run("SELECT 1");
 	assert !after.ok && after.error.code == ErrorCode.Misuse;
 	const exec = db.exec("SELECT 1");
 	assert !exec.ok && exec.error.code == ErrorCode.Misuse;
@@ -957,12 +1024,12 @@ test "an explicit close checkpoints the WAL file" {
 test "sqlite's result code reaches the error as its case, with message and SQL" {
 	const db = memory();
 	assert db.exec("CREATE TABLE u (k TEXT UNIQUE)").ok;
-	assert db.run("INSERT INTO u VALUES (?)", [text("a")]).ok;
-	const dup = db.run("INSERT INTO u VALUES (?)", [text("a")]);
+	assert db.run("INSERT INTO u VALUES (?)", [Param.text("a")]).ok;
+	const dup = db.run("INSERT INTO u VALUES (?)", [Param.text("a")]);
 	assert !dup.ok && dup.error.code == ErrorCode.Constraint && dup.error.extended == 2067;
 	assert dup.error.message.contains("UNIQUE constraint failed: u.k");
 	assert dup.error.sql == "INSERT INTO u VALUES (?)";
-	const bad = db.run("SELEC 1", []);
+	const bad = db.run("SELEC 1");
 	assert !bad.ok && bad.error.code == ErrorCode.Generic;
 	assert bad.error.message.contains("syntax error");
 	const missing = db.exec("INSERT INTO nowhere VALUES (1)");
@@ -993,9 +1060,13 @@ test "a write lock held by another connection is Busy once the timeout passes" {
 
 test "a parameter count that does not match the statement is refused" {
 	const db = memory();
-	const few = db.run("SELECT ?, ?", [integer(1)]);
+	const none = db.run("SELECT ?");
+	assert !none.ok && none.error.code == ErrorCode.Range;
+	const noneRead = db.get<Count>("SELECT ? AS n");
+	assert !noneRead.ok && noneRead.error.code == ErrorCode.Range;
+	const few = db.run("SELECT ?, ?", [Param.integer(1)]);
 	assert !few.ok && few.error.code == ErrorCode.Range;
-	const many = db.run("SELECT ?", [integer(1), integer(2)]);
+	const many = db.run("SELECT ?", [Param.integer(1), Param.integer(2)]);
 	assert !many.ok && many.error.code == ErrorCode.Range;
 }
 
@@ -1016,7 +1087,7 @@ test "a second statement after multi-byte text is refused, not dropped" {
 	const sql = "SELECT '" + "🚀".repeat(20) + "'; DROP TABLE t";
 	const prepared = db.prepare(sql);
 	assert !prepared.ok && prepared.error.code == ErrorCode.Misuse;
-	const ran = db.run(sql, []);
+	const ran = db.run(sql);
 	assert !ran.ok && ran.error.code == ErrorCode.Misuse;
 	assert countOf(db, "SELECT count(*) AS n FROM t") == 0;
 }
@@ -1027,7 +1098,7 @@ test "a prepared statement binds, steps, resets and reads columns" {
 	assert prepared.ok;
 	const stmt = prepared.value;
 	assert stmt.parameterCount() == 1 && stmt.columnCount() == 2 && stmt.columnName(0) == "next";
-	assert stmt.bind(1, integer(41)).ok;
+	assert stmt.bind(1, Param.integer(41)).ok;
 	const first = stmt.step();
 	assert first.ok && first.value;
 	assert stmt.columnKind(0) == ColumnKind.Integer;
@@ -1038,7 +1109,7 @@ test "a prepared statement binds, steps, resets and reads columns" {
 	const done = stmt.step();
 	assert done.ok && !done.value;
 	stmt.reset();
-	assert stmt.bind(1, real(1.5)).ok;
+	assert stmt.bind(1, Param.real(1.5)).ok;
 	assert stmt.step().ok;
 	const r = stmt.realAt(0);
 	assert r.ok && r.value == 2.5;
@@ -1047,16 +1118,16 @@ test "a prepared statement binds, steps, resets and reads columns" {
 
 test "rows forward as JSON with every storage class encoded" {
 	const db = memory();
-	const r = db.queryJson(
+	const r = db.allJson(
 		"SELECT 9007199254740993 AS i, 0.1 AS r, 'q\"\\\n\t' || char(1) AS t, x'4d61' AS b, " +
 			"NULL AS n, 1e999 AS inf, -1e999 AS ninf, ? AS p",
-		[text("é🚀")],
+		[Param.text("é🚀")],
 	);
 	assert r.ok;
 	assert r.value == "[{\"i\":9007199254740993,\"r\":0.1," +
 		"\"t\":\"q\\\"\\\\\\n\\t\\u0001\",\"b\":\"TWE=\"," +
 		"\"n\":null,\"inf\":null,\"ninf\":null,\"p\":\"é🚀\"}]";
-	const empty = db.queryJson("SELECT 1 AS a WHERE 0", []);
+	const empty = db.allJson("SELECT 1 AS a WHERE 0");
 	assert empty.ok && empty.value == "[]";
 	const parsed = JSON.parseValue(r.value);
 	assert parsed.ok;
@@ -1064,9 +1135,9 @@ test "rows forward as JSON with every storage class encoded" {
 
 test "text holding a NUL byte is refused rather than cut short" {
 	const db = memory();
-	const json = db.queryJson("SELECT 'a' || char(0) || 'b' AS t", []);
+	const json = db.allJson("SELECT 'a' || char(0) || 'b' AS t");
 	assert !json.ok && json.error.code == ErrorCode.OutOfRange;
 	struct Text { t: string; }
-	const typed = db.query<Text>("SELECT 'a' || char(0) || 'b' AS t", []);
+	const typed = db.all<Text>("SELECT 'a' || char(0) || 'b' AS t");
 	assert !typed.ok && typed.error.code == ErrorCode.OutOfRange;
 }
