@@ -155,16 +155,16 @@ An actor that owns the writer can also group commits: many small `record` SENDs 
 ## Performance
 
 Measured on an Apple M-series Mac (14 cores) that was also running other work, so read the
-ratios, not the absolute times. `--release` build, medians of 5 interleaved runs. The C column
+ratios, not the absolute times; the rows were measured in two sessions, so compare within a row. `--release` build, medians of 5 interleaved runs. The C column
 does the same work directly against the same amalgamation with the same flags
 (`bench/baseline.c`).
 
 | Workload | MetaScript | C | Ratio |
 |---|---|---|---|
-| INSERT, positional parameters, one transaction | 488 ns | 260 ns | 1.9× |
-| INSERT, `named(...)` | 896 ns | 255 ns | 3.5× |
+| INSERT, positional parameters, one transaction | 506 ns | 204 ns | 2.5× |
+| INSERT, `named(...)` | 715 ns | 203 ns | 3.5× |
 | `query<T>`, per row | 246 ns | 104 ns | 2.4× |
-| `queryOne<T>` by primary key | 1989 ns | 593 ns | 3.4× |
+| `queryOne<T>` by primary key | 855 ns | 477 ns | 1.8× |
 | `queryJson`, per row | 429 µs | 459 ns | see below |
 
 Group commit through an actor, WAL file, 20 000 rows (`bench/actors.ms`): 16.2 µs per row with
@@ -175,8 +175,9 @@ Known gaps, each traced to its cause:
 - `queryJson` is quadratic in the result size because of a compiler issue: appending the result
   of a `try` expression to a string copies the whole string. Writing the cell into a local first
   measures 642 ns per row (1.4× C). The fix belongs in the compiler, so the library waits for it.
-- `queryOne` and named binding recompute column positions and parameter names on every call.
-  Caching them per statement is in progress.
+- A prepared statement remembers the column positions of the struct it last decoded and the names
+  of its parameters, and resolves them again only after SQLite recompiles it for a schema change.
+  That halved `queryOne`; most of what remains is the statement cache lookup and string copies.
 - Reader actors do not yet read in parallel: actors created on the main thread currently share
   one scheduler, so eight reader actors read no faster than one. The runtime fix is designed;
   `spawn` already scales across cores.
