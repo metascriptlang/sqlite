@@ -419,6 +419,26 @@ test "a named parameter used twice binds once from one field" {
 	assert r.ok && r.value != null && r.value!.host == "aa";
 }
 
+struct NoFields {}
+
+test "named values are checked against the statement on every run, not only the first" {
+	const db = memory();
+	const sql = "SELECT :host AS host";
+	const none: NoFields = {};
+	const host: HostOnly = { host: "a" };
+	const extra: HostBusy = { host: "b", busy: 1.5 };
+	const empty = db.get<HostOnly>(sql, named(none));
+	assert !empty.ok && empty.error.code == ErrorCode.Range;
+	const first = db.get<HostOnly>(sql, named(host));
+	assert first.ok && first.value != null && first.value!.host == "a";
+	const more = db.get<HostOnly>(sql, named(extra));
+	assert !more.ok && more.error.code == ErrorCode.Range && more.error.message.contains("busy");
+	const fewer = db.get<HostOnly>(sql, named(none));
+	assert !fewer.ok && fewer.error.code == ErrorCode.Range && fewer.error.message.contains(":host");
+	const again = db.get<HostOnly>(sql, named(host));
+	assert again.ok && again.value != null && again.value!.host == "a";
+}
+
 test "binding an index outside the statement is Range" {
 	const db = memory();
 	const p = db.prepare("SELECT ?");
