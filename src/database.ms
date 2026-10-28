@@ -199,7 +199,8 @@ export class Database {
 	// keeps use order, so eviction takes the least recently used statement.
 	private acquire(sql: string): Result<Lease, SqliteError> {
 		try this.live(sql);
-		const hit = this.cache.get(sql);
+		const recent = this.mostRecent;
+		const hit = recent != null && recent.statement.sql == sql ? recent : this.cache.get(sql);
 		if (hit != null && !hit.stepping) {
 			hit.stepping = true;
 			if (hit != this.mostRecent) {
