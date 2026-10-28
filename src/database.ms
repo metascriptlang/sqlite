@@ -70,12 +70,23 @@ function openFlags(options: OpenOptions): int32 {
 	return mode | threading | OPEN_URI;
 }
 
+// A statement on loan to one query: cached ones go back to the cache, others are finalized.
+class Lease {
+	readonly statement: Statement;
+	readonly cached: boolean;
+	stepping: boolean = false;
+
+	constructor(statement: Statement, cached: boolean) {
+		this.statement = statement;
+		this.cached = cached;
+	}
+}
+
 export class Database {
 	readonly path: string;
 	private connection: Connection;
-	private cache: Map<string, Statement> = new Map<string, Statement>();
-	private stepping: Set<string> = new Set<string>();
-	private mostRecent: Statement | null = null;
+	private cache: Map<string, Lease> = new Map<string, Lease>();
+	private mostRecent: Lease | null = null;
 	private cacheSize: int32;
 	private depth: int32 = 0;
 	// The failed outermost rollback that left a transaction open; only close() runs after it.
@@ -145,11 +156,10 @@ export class Database {
 		const pointer = this.connection.pointer;
 		if (pointer == null) return Result.ok(null);
 		for (const sql of this.cache) {
-			const stmt = this.cache.get(sql);
-			if (stmt != null) stmt.finalize();
+			const lease = this.cache.get(sql);
+			if (lease != null) lease.statement.finalize();
 		}
 		this.cache.clear();
-		this.stepping.clear();
 		this.mostRecent = null;
 		const rc = msqClose(pointer);
 		if (rc != SQLITE_OK) return Result.err(this.connection.failure(rc, ""));
@@ -187,11 +197,11 @@ export class Database {
 
 	// The cached statement for `sql`, or a fresh one while the cached one is in use. The cache
 	// keeps use order, so eviction takes the least recently used statement.
-	private acquire(sql: string): Result<Statement, SqliteError> {
+	private acquire(sql: string): Result<Lease, SqliteError> {
 		try this.live(sql);
 		const hit = this.cache.get(sql);
-		if (hit != null && !this.stepping.has(sql)) {
-			this.stepping.add(sql);
+		if (hit != null && !hit.stepping) {
+			hit.stepping = true;
 			if (hit != this.mostRecent) {
 				this.cache.delete(sql);
 				this.cache.set(sql, hit);
@@ -199,36 +209,39 @@ export class Database {
 			}
 			return Result.ok(hit);
 		}
-		const stmt = try this.compile(sql, hit == null);
-		if (hit != null || this.cacheSize <= 0) return Result.ok(stmt);
+		const cached = hit == null && this.cacheSize > 0;
+		const lease = new Lease(try this.compile(sql, cached), cached);
+		if (!cached) return Result.ok(lease);
 		if (this.cache.size >= this.cacheSize) this.evictOne();
-		this.stepping.add(sql);
-		this.cache.set(sql, stmt);
-		this.mostRecent = stmt;
-		return Result.ok(stmt);
+		lease.stepping = true;
+		this.cache.set(sql, lease);
+		this.mostRecent = lease;
+		return Result.ok(lease);
 	}
 
 	private evictOne(): void {
 		let oldest: string | null = null;
 		for (const sql of this.cache) {
-			if (!this.stepping.has(sql)) {
+			const lease = this.cache.get(sql);
+			if (lease != null && !lease.stepping) {
 				oldest = sql;
 				break;
 			}
 		}
 		if (oldest == null) return;
-		const stmt = this.cache.get(oldest);
-		if (stmt != null) stmt.finalize();
+		const lease = this.cache.get(oldest);
+		if (lease != null) lease.statement.finalize();
 		this.cache.delete(oldest);
 	}
 
-	private release(stmt: Statement): void {
+	private release(lease: Lease): void {
+		const stmt = lease.statement;
 		stmt.decodeFailure = null;
-		if (this.cache.get(stmt.sql) != stmt) {
+		if (!lease.cached) {
 			stmt.finalize();
 			return;
 		}
-		this.stepping.delete(stmt.sql);
+		lease.stepping = false;
 		stmt.reset();
 		stmt.clearBindings();
 	}
@@ -315,10 +328,10 @@ export class Database {
 		params: P,
 		use: (stmt: Statement) => Result<R, SqliteError>,
 	): Result<R, SqliteError> {
-		const stmt = try this.acquire(sql);
-		defer this.release(stmt);
-		try stmt.bindAll(params);
-		return use(stmt);
+		const lease = try this.acquire(sql);
+		defer this.release(lease);
+		try lease.statement.bindAll(params);
+		return use(lease.statement);
 	}
 
 	// Decodes rows into `T` until `visit` returns false or the rows end; gives the rows visited.
